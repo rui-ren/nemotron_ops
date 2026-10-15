@@ -65,17 +65,17 @@ def rel(a, b):
 FP4 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
 
 
-def test_nvfp4(R, N, K):
+def test_nvfp4(R, N, K, XSCALE=2.0):
     torch.manual_seed(1)
     w = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8)
     ws = torch.randint(0x30, 0x48, (N, K // 16), dtype=torch.uint8)  # e4m3 bytes, positive small range
     g = torch.tensor([0.37])
-    x = torch.randn(R, K).bfloat16() * 2
+    x = torch.randn(R, K).bfloat16() * XSCALE
     deq = torch.stack([FP4[(w & 15).long()], FP4[(w >> 4).long()]], -1).reshape(N, K)
     s = ws.view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)
     ref = x.float() @ (deq * s * g).T
     (y,) = run("Nvfp4Gemv", [("x", x.to(DEV)), ("w", w.to(DEV)), ("ws", ws.to(DEV)), ("g", g.to(DEV))], [BF])
-    print(f"Nvfp4Gemv R={R} N={N} K={K}: rel err {rel(y, ref):.2e}")
+    print(f"Nvfp4Gemv R={R} N={N} K={K} |x|~{XSCALE}: rel err {rel(y, ref):.2e}")
     assert rel(y, ref) < 1e-2
 
 
@@ -199,6 +199,7 @@ if __name__ == "__main__":
     for R in (1, 2, 8):
         test_nvfp4(R, 18560, 4096)
     test_nvfp4(1, 4096, 8192)
+    test_nvfp4(1, 18560, 4096, XSCALE=3000.0)  # massive activations must not overflow the fp16 partial sums
     for bits in (8, 4):
         for R, N, K in ((1, 1024, 4096), (1, 4096, 1024), (4, 4096, 5376), (1, 131072, 4096)):
             test_qgemv(bits, R, N, K)

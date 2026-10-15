@@ -495,6 +495,9 @@ __device__ __forceinline__ float Fp8E4M3ToFloat(uint32_t byte) {
   return __half2float(__half(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(byte), __NV_E4M3)));
 }
 
+// x is pre-scaled by 2^-6 so that fp16 partial sums of 16 products cannot overflow for |x| < ~4e4 (massive activations).
+constexpr float kXScale = 1.0f / 64.0f;
+
 // A warp owns ROWS weight rows; lane l handles 16-byte (32-value) chunks l + 32*it. All weight loads are issued up front.
 template <int R, int ROWS, int IT>
 __global__ void Nvfp4GemvKernel(const bf16* __restrict__ x, const uint8_t* __restrict__ w,
@@ -534,7 +537,7 @@ __global__ void Nvfp4GemvKernel(const bf16* __restrict__ x, const uint8_t* __res
         const uint4 v = xq[g];
         const bf16* b = reinterpret_cast<const bf16*>(&v);
 #pragma unroll
-        for (int p = 0; p < 4; ++p) xp[g * 4 + p] = __floats2half2_rn(B2F(b[p]), B2F(b[p + 4]));
+        for (int p = 0; p < 4; ++p) xp[g * 4 + p] = __floats2half2_rn(B2F(b[p]) * kXScale, B2F(b[p + 4]) * kXScale);
       }
 #pragma unroll
       for (int i = 0; i < ROWS; ++i) {
@@ -554,7 +557,7 @@ __global__ void Nvfp4GemvKernel(const bf16* __restrict__ x, const uint8_t* __res
               a = __hfma2(pat, xp[(blk * 2 + wd) * 4 + p], a);
             }
           }
-          const float f = __low2float(a) + __high2float(a);
+          const float f = (__low2float(a) + __high2float(a)) * (1.0f / kXScale);
           tot += f * Fp8E4M3ToFloat((sc[i][it] >> (8 * blk)) & 0xFFu);
         }
         acc[i][r] += tot;
