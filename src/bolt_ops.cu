@@ -96,8 +96,9 @@ __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R, int proj_s
   }
 }
 
-// One block per head. State layout [heads, ds, hd] (hd contiguous), fp32. Thread (p, half) owns state[n in half][p].
-template <int DS, int HD>
+// One block per head. State layout [heads, ds, hd] (hd contiguous), fp32. Thread (p, part) owns state[n in part][p]; the QP parts
+// split d_state (more threads per head = shorter dependent chains over the R rows).
+template <int DS, int HD, int QP>
 __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_stride, int di, int conv_dim, int heads,
                                int heads_per_group, const bf16* __restrict__ xbc_act,
                                const float* __restrict__ ssm_in, const float* __restrict__ dt_bias,
@@ -108,11 +109,11 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_st
   const int g = h / heads_per_group;
   const int tid = threadIdx.x;
   const int p = tid % HD;
-  const int half = tid / HD;  // 0 or 1
-  constexpr int NH = DS / 2;
+  const int half = tid / HD;  // 0 .. QP-1
+  constexpr int NH = DS / QP;
   __shared__ float sB[kMaxRows][DS];
   __shared__ float sC[kMaxRows][DS];
-  __shared__ float sPart[kMaxRows][2][HD];
+  __shared__ float sPart[kMaxRows][QP][HD];
   __shared__ float sDt[kMaxRows];
   const int b_off = di + g * DS;
   const int c_off = di + (heads / heads_per_group) * DS + g * DS;
@@ -162,7 +163,10 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_st
   for (int i = tid; i < R * HD; i += blockDim.x) {
     const int r = i / HD, pp = i % HD;
     const float x = B2F(xbc_act[static_cast<int64_t>(r) * conv_dim + h * HD + pp]);
-    ypre[static_cast<int64_t>(r) * di + h * HD + pp] = sPart[r][0][pp] + sPart[r][1][pp] + D * x;
+    float sum = D * x;
+#pragma unroll
+    for (int q = 0; q < QP; ++q) sum += sPart[r][q][pp];
+    ypre[static_cast<int64_t>(r) * di + h * HD + pp] = sum;
   }
 }
 
@@ -232,7 +236,12 @@ struct MambaStepState {
       MambaConvKernel<<<(conv_dim + 127) / 128, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
                                                            In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
                                                            Out<bf16>(xbc_act), sel, verify);
-      MambaSsmKernel<128, 64><<<heads, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
+      // QP = 4 state parts (256 threads/head) for the multi-row verify path, 2 parts (128 threads) for single-token decode
+      if (R > 1) MambaSsmKernel<128, 64, 4><<<heads, 256, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
+                                                     Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
+                                                     In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
+                                                     Out<float>(ypre), sel, verify);
+      else MambaSsmKernel<128, 64, 2><<<heads, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
                                                      Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
                                                      In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
                                                      Out<float>(ypre), sel, verify);
