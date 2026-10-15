@@ -123,7 +123,7 @@ def test_route(R, E, topk=9, K=4096):
     assert same and rel(got, ref) < 1e-3
 
 
-def test_moe_decode(R, E, I, topk=9):
+def test_moe_decode(R, E, I, topk=9, op="MoeDecode"):
     torch.manual_seed(4)
     z = (torch.randn(R, 1024) * 0.5).bfloat16()
     idx = torch.stack([torch.randperm(E)[:topk] for _ in range(R)]).int()
@@ -145,9 +145,9 @@ def test_moe_decode(R, E, I, topk=9):
             h = (z[t].float() @ d1[e].T).bfloat16().float()
             h = (torch.relu(h) ** 2).bfloat16().float()
             ref[t] += w[t, j] * (h @ d2[e].T).bfloat16().float()
-    out = run("MoeDecode", [("z", z.to(DEV)), ("i", idx.to(DEV)), ("w", w.to(DEV)), ("w1", w1.to(DEV)), ("s1", s1.to(DEV)),
-                            ("w2", w2.to(DEV)), ("s2", s2.to(DEV))], [BF, BF, F32], {"topk": topk})[0]
-    print(f"MoeDecode R={R} E={E} I={I}: rel err {rel(out, ref):.2e}")
+    out = run(op, [("z", z.to(DEV)), ("i", idx.to(DEV)), ("w", w.to(DEV)), ("w1", w1.to(DEV)), ("s1", s1.to(DEV)),
+                   ("w2", w2.to(DEV)), ("s2", s2.to(DEV))], [BF, BF, F32] + ([I32] if op == "MoeVerify" else []), {"topk": topk})[0]
+    print(f"{op} R={R} E={E} I={I}: rel err {rel(out, ref):.2e}")
     assert rel(out, ref) < 1e-2
 
 
@@ -232,15 +232,21 @@ if __name__ == "__main__":
     for R in (1, 2, 8):
         test_nvfp4(R, 18560, 4096)
     test_nvfp4(1, 4096, 8192)
+    for R, N, K in ((2, 4096, 8192), (3, 4096, 8192), (5, 1024, 4096), (8, 4096, 8192), (7, 18560, 4096)):
+        test_nvfp4(R, N, K)
+    test_nvfp4(8, 18560, 4096, XSCALE=3000.0)
     test_nvfp4(1, 18560, 4096, XSCALE=3000.0)  # massive activations must not overflow the fp16 partial sums
     for bits in (8, 4):
-        for R, N, K in ((1, 1024, 4096), (1, 4096, 1024), (4, 4096, 5376), (1, 131072, 4096)):
+        for R, N, K in ((1, 1024, 4096), (1, 4096, 1024), (4, 4096, 5376), (1, 131072, 4096), (8, 131072, 4096), (3, 1024, 4096),
+                        (8, 4096, 1024), (6, 4096, 5376), (5, 2688, 4096)):
             test_qgemv(bits, R, N, K)
     test_relu2()
     for R, E in ((1, 240), (4, 496), (8, 304)):
         test_route(R, E)
     for R, E, I in ((1, 240, 2048), (2, 304, 2304), (1, 496, 2560)):
         test_moe_decode(R, E, I)
+    for R, E, I in ((1, 240, 2048), (8, 304, 2304), (5, 496, 2560), (8, 12, 2048), (8, 240, 2048)):  # E=12: every expert shared by many rows
+        test_moe_decode(R, E, I, topk=9 if E > 12 else 6, op="MoeVerify")
     for R in (1, 2, 8, 16):
         test_mamba(R)
     test_mamba_verify(8, 3)

@@ -617,6 +617,349 @@ void LaunchNvfp4(const bf16* x, const uint8_t* w, const uint8_t* ws, const float
   else throw std::invalid_argument("Nvfp4Gemv: K must be 4096 or 8192");
 }
 
+// ------------------------------------------------------------------------------------------------------------------
+// Tensor-core skinny GEMM (2 <= R <= 8 rows): y[R,N] = x[R,K] @ W^T with mma.m16n8k16 (bf16 in, fp32 accumulate).
+// ------------------------------------------------------------------------------------------------------------------
+// A = 16 weight rows, B = the (<= 8) activation rows. A warp walks 64-wide K chunks; thread (g = lane/4, t = lane%4) owns the
+// 16 consecutive k of weight rows g and g+8 at k = 64c + 16t (one 16-byte load for int8, 8 bytes for int4 / fp4), so the
+// weights need no repacking. mma sums over k, so any k permutation shared by A and B is valid: MMA step s uses
+// k-slots (s, s+4) and (8+s, 12+s) of the thread's 16 values (adjacent nibbles/bytes need no shuffling, only x is paired up).
+enum { kFmtQ8 = 0, kFmtQ4 = 1, kFmtFp4 = 2 };
+
+__device__ __forceinline__ void Mma16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                         uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t PackBf16(float lo, float hi) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&v);
+}
+__device__ __forceinline__ __nv_bfloat162 AsBf162(uint32_t v) { return *reinterpret_cast<__nv_bfloat162*>(&v); }
+__device__ __forceinline__ uint32_t AsU32(__nv_bfloat162 v) { return *reinterpret_cast<uint32_t*>(&v); }
+
+// (byte `s` of w) as the integer value in a float: 2^23 + byte
+__device__ __forceinline__ float ByteToMagic(uint32_t w, int s) {
+  return __uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | s));
+}
+
+template <int FMT>
+__device__ __forceinline__ void LoadWeightRow(const uint8_t* w, const void* sc, int64_t row, int K, int c, int t, uint4& raw,
+                                              float& scale) {
+  if constexpr (FMT == kFmtQ8) {
+    raw = __ldg(reinterpret_cast<const uint4*>(w + row * K + 64 * c + 16 * t));
+    scale = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
+  } else {
+    const uint2 v = __ldg(reinterpret_cast<const uint2*>(w + row * (K / 2) + 32 * c + 8 * t));
+    raw = make_uint4(v.x, v.y, 0u, 0u);
+    if constexpr (FMT == kFmtQ4) scale = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
+    else scale = Fp8E4M3ToFloat(reinterpret_cast<const uint8_t*>(sc)[row * (K / 16) + 4 * c + t]);
+  }
+}
+
+// Dequantised bf16x2 pairs for MMA step s: lo[s] = k-slots (s, s+4), hi[s] = (8+s, 12+s).
+template <int FMT>
+__device__ __forceinline__ void DequantRow(const uint4& raw, float scale, uint32_t* lo, uint32_t* hi) {
+  if constexpr (FMT == kFmtQ8) {
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      lo[s] = PackBf16((ByteToMagic(raw.x, s) - 8388736.0f) * scale, (ByteToMagic(raw.y, s) - 8388736.0f) * scale);
+      hi[s] = PackBf16((ByteToMagic(raw.z, s) - 8388736.0f) * scale, (ByteToMagic(raw.w, s) - 8388736.0f) * scale);
+    }
+  } else if constexpr (FMT == kFmtQ4) {
+    const __nv_bfloat162 sc2 = __bfloat162bfloat162(__float2bfloat16(scale));
+    const __nv_bfloat162 zp = __floats2bfloat162_rn(136.f, 136.f);
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      // nibble s and s+4 of a word -> bf16 128 + q (exact), then (q - 8) * scale
+      const uint32_t a = ((raw.x >> (4 * s)) & 0x000F000Fu) | 0x43004300u;
+      const uint32_t b = ((raw.y >> (4 * s)) & 0x000F000Fu) | 0x43004300u;
+      lo[s] = AsU32(__hmul2(__hsub2(AsBf162(a), zp), sc2));
+      hi[s] = AsU32(__hmul2(__hsub2(AsBf162(b), zp), sc2));
+    }
+  } else {
+    // e2m1 -> bf16 pattern worth value * 2^-126 (subnormal for |v| = 0.5), renormalised by 2^126, then the block scale
+    const __nv_bfloat162 sc2 = __bfloat162bfloat162(__float2bfloat16(scale));
+    const __nv_bfloat162 renorm = AsBf162(0x7E807E80u);
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const uint32_t pa = raw.x >> (4 * s), pb = raw.y >> (4 * s);
+      const uint32_t a = ((pa << 6) & 0x01C001C0u) | ((pa << 12) & 0x80008000u);
+      const uint32_t b = ((pb << 6) & 0x01C001C0u) | ((pb << 12) & 0x80008000u);
+      lo[s] = AsU32(__hmul2(__hmul2(AsBf162(a), renorm), sc2));
+      hi[s] = AsU32(__hmul2(__hmul2(AsBf162(b), renorm), sc2));
+    }
+  }
+}
+
+template <int FMT, int MT, int KW>
+__global__ void __launch_bounds__(KW * 32)
+    MmaGemvKernel(const bf16* __restrict__ x, const uint8_t* __restrict__ w, const void* __restrict__ sc,
+                  const float* __restrict__ gscale, int R, int N, int K, bf16* __restrict__ y) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int nchunks = K / 64;
+  const int64_t n_base = static_cast<int64_t>(blockIdx.x) * (MT * 16);
+  const bf16* xr = x + static_cast<int64_t>(min(g, R - 1)) * K;
+  const bool xvalid = g < R;
+
+  struct Stage {
+    uint4 raw[MT][2];
+    float sc[MT][2];
+    uint4 xa, xb;
+  };
+  float acc[MT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
+
+  auto load = [&](int c, Stage& st) {
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int64_t row = min(n_base + m * 16 + g + 8 * h, static_cast<int64_t>(N - 1));
+        LoadWeightRow<FMT>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+      }
+    const uint4* xp = reinterpret_cast<const uint4*>(xr + 64 * c + 16 * t);
+    st.xa = xvalid ? __ldg(xp) : make_uint4(0, 0, 0, 0);
+    st.xb = xvalid ? __ldg(xp + 1) : make_uint4(0, 0, 0, 0);
+  };
+
+  Stage cur, nxt;
+  int c = warp;
+  if (c < nchunks) load(c, cur);
+  for (; c < nchunks; c += KW) {
+    if (c + KW < nchunks) load(c + KW, nxt);
+    uint32_t bl[4], bh[4];
+    bl[0] = __byte_perm(cur.xa.x, cur.xa.z, 0x5410);
+    bl[1] = __byte_perm(cur.xa.x, cur.xa.z, 0x7632);
+    bl[2] = __byte_perm(cur.xa.y, cur.xa.w, 0x5410);
+    bl[3] = __byte_perm(cur.xa.y, cur.xa.w, 0x7632);
+    bh[0] = __byte_perm(cur.xb.x, cur.xb.z, 0x5410);
+    bh[1] = __byte_perm(cur.xb.x, cur.xb.z, 0x7632);
+    bh[2] = __byte_perm(cur.xb.y, cur.xb.w, 0x5410);
+    bh[3] = __byte_perm(cur.xb.y, cur.xb.w, 0x7632);
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      uint32_t lo0[4], hi0[4], lo1[4], hi1[4];
+      DequantRow<FMT>(cur.raw[m][0], cur.sc[m][0], lo0, hi0);
+      DequantRow<FMT>(cur.raw[m][1], cur.sc[m][1], lo1, hi1);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) Mma16816(acc[m], lo0[s], lo1[s], hi0[s], hi1[s], bl[s], bh[s]);
+    }
+    cur = nxt;
+  }
+
+  extern __shared__ float red[];  // [KW][MT*16][8]
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    float* r0 = red + (warp * MT * 16 + m * 16 + g) * 8 + 2 * t;
+    r0[0] = acc[m][0];
+    r0[1] = acc[m][1];
+    r0[8 * 8] = acc[m][2];
+    r0[8 * 8 + 1] = acc[m][3];
+  }
+  __syncthreads();
+  const float gs = gscale ? gscale[0] : 1.0f;
+  for (int i = threadIdx.x; i < MT * 16 * 8; i += KW * 32) {
+    const int rl = i >> 3, col = i & 7;
+    if (col >= R || n_base + rl >= N) continue;
+    float v = 0.f;
+#pragma unroll
+    for (int k = 0; k < KW; ++k) v += red[(k * MT * 16 + rl) * 8 + col];
+    y[static_cast<int64_t>(col) * N + n_base + rl] = __float2bfloat16(v * gs);
+  }
+}
+
+template <int FMT, int MT, int KW>
+void LaunchMmaGemvImpl(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
+                       cudaStream_t s) {
+  const int blocks = (N + MT * 16 - 1) / (MT * 16);
+  MmaGemvKernel<FMT, MT, KW><<<blocks, KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(x, w, sc, gs, R, N, K, y);
+}
+
+template <int FMT>
+void LaunchMmaGemv(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
+                   cudaStream_t s) {
+  if (N >= 8192) LaunchMmaGemvImpl<FMT, 2, 4>(x, w, sc, gs, R, N, K, y, s);
+  else if (K >= 4096) LaunchMmaGemvImpl<FMT, 1, 8>(x, w, sc, gs, R, N, K, y, s);
+  else LaunchMmaGemvImpl<FMT, 1, 4>(x, w, sc, gs, R, N, K, y, s);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// MoeVerify: MoeDecode for R <= 8 rows with experts shared across rows. The (token, expert) pairs are grouped by expert; every
+// unique expert's int4 weights are read once and applied to all rows with the tensor-core GEMM above (the 8 columns of the
+// MMA are the rows, so rows that did not select the expert simply compute an unused column).
+// ------------------------------------------------------------------------------------------------------------------
+// meta (int32): [0] = #unique experts U', [1 .. P] = unique expert ids, [1+P + u*8 + row] = pair index (row * topk + k) or -1
+__global__ void MoeGroupKernel(const int* __restrict__ idx, int P, int topk, int* __restrict__ meta) {
+  __shared__ int sidx[128], srank[128], warp_tot[4];
+  const int p = threadIdx.x, lane = p & 31, warp = p >> 5;
+  for (int i = p; i < P * 8; i += blockDim.x) meta[1 + P + i] = -1;
+  if (p < P) sidx[p] = idx[p];
+  __syncthreads();
+  int q = -1;
+  if (p < P) {
+    for (int j = 0; j <= p; ++j)
+      if (sidx[j] == sidx[p]) { q = j; break; }
+  }
+  const bool first = p < P && q == p;
+  const unsigned b = __ballot_sync(0xffffffffu, first);
+  if (lane == 0) warp_tot[warp] = __popc(b);
+  __syncthreads();
+  int off = 0;
+  for (int w = 0; w < warp; ++w) off += warp_tot[w];
+  if (first) {
+    srank[p] = off + __popc(b & ((1u << lane) - 1u));
+    meta[1 + srank[p]] = sidx[p];
+  }
+  if (p == 0) meta[0] = warp_tot[0] + warp_tot[1] + warp_tot[2] + warp_tot[3];
+  __syncthreads();
+  if (p < P) meta[1 + P + srank[q] * 8 + p / topk] = p;
+}
+
+// PH 1: h[pair, j] = relu2(bf16(sum_k z[row, k] * W1[e, j, k])); PH 2: part[pair, n] = bf16(sum_k h[pair, k] * W2[e, n, k]).
+template <int PH, int MT, int KW>
+__global__ void __launch_bounds__(KW * 32)
+    MoeMmaKernel(const bf16* __restrict__ xin, const int* __restrict__ meta, int P, int R, int Nrows, int K,
+                 const uint8_t* __restrict__ w, const bf16* __restrict__ sc, void* __restrict__ out) {
+  const int u = blockIdx.y;
+  if (u >= meta[0]) return;
+  const int64_t e = meta[1 + u];
+  const int* pair_of = meta + 1 + P + u * 8;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int nchunks = K / 64;
+  const int n_base = blockIdx.x * (MT * 16);
+  const int xpair = pair_of[g];
+  const bf16* xr = xin;
+  bool xvalid;
+  if constexpr (PH == 1) {
+    xvalid = g < R;
+    xr += static_cast<int64_t>(min(g, R - 1)) * K;
+  } else {
+    xvalid = xpair >= 0;
+    xr += static_cast<int64_t>(max(xpair, 0)) * K;
+  }
+
+  struct Stage {
+    uint4 raw[MT][2];
+    float sc[MT][2];
+    uint4 xa, xb;
+  };
+  float acc[MT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
+  auto load = [&](int c, Stage& st) {
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int64_t row = e * Nrows + min(n_base + m * 16 + g + 8 * h, Nrows - 1);
+        LoadWeightRow<kFmtQ4>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+      }
+    const uint4* xp = reinterpret_cast<const uint4*>(xr + 64 * c + 16 * t);
+    st.xa = xvalid ? __ldg(xp) : make_uint4(0, 0, 0, 0);
+    st.xb = xvalid ? __ldg(xp + 1) : make_uint4(0, 0, 0, 0);
+  };
+  Stage cur, nxt;
+  int c = warp;
+  if (c < nchunks) load(c, cur);
+  for (; c < nchunks; c += KW) {
+    if (c + KW < nchunks) load(c + KW, nxt);
+    uint32_t bl[4], bh[4];
+    bl[0] = __byte_perm(cur.xa.x, cur.xa.z, 0x5410);
+    bl[1] = __byte_perm(cur.xa.x, cur.xa.z, 0x7632);
+    bl[2] = __byte_perm(cur.xa.y, cur.xa.w, 0x5410);
+    bl[3] = __byte_perm(cur.xa.y, cur.xa.w, 0x7632);
+    bh[0] = __byte_perm(cur.xb.x, cur.xb.z, 0x5410);
+    bh[1] = __byte_perm(cur.xb.x, cur.xb.z, 0x7632);
+    bh[2] = __byte_perm(cur.xb.y, cur.xb.w, 0x5410);
+    bh[3] = __byte_perm(cur.xb.y, cur.xb.w, 0x7632);
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      uint32_t lo0[4], hi0[4], lo1[4], hi1[4];
+      DequantRow<kFmtQ4>(cur.raw[m][0], cur.sc[m][0], lo0, hi0);
+      DequantRow<kFmtQ4>(cur.raw[m][1], cur.sc[m][1], lo1, hi1);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) Mma16816(acc[m], lo0[s], lo1[s], hi0[s], hi1[s], bl[s], bh[s]);
+    }
+    cur = nxt;
+  }
+  extern __shared__ float red[];
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    float* r0 = red + (warp * MT * 16 + m * 16 + g) * 8 + 2 * t;
+    r0[0] = acc[m][0];
+    r0[1] = acc[m][1];
+    r0[8 * 8] = acc[m][2];
+    r0[8 * 8 + 1] = acc[m][3];
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < MT * 16 * 8; i += KW * 32) {
+    const int rl = i >> 3, col = i & 7;
+    const int j = n_base + rl;
+    if (j >= Nrows) continue;
+    const int pair = pair_of[col];
+    if (pair < 0) continue;
+    float v = 0.f;
+#pragma unroll
+    for (int k = 0; k < KW; ++k) v += red[(k * MT * 16 + rl) * 8 + col];
+    v = B2F(__float2bfloat16(v));
+    if constexpr (PH == 1) {
+      const float r = fmaxf(v, 0.f);
+      reinterpret_cast<bf16*>(out)[static_cast<int64_t>(pair) * Nrows + j] = __float2bfloat16(r * r);
+    } else {
+      reinterpret_cast<float*>(out)[static_cast<int64_t>(pair) * Nrows + j] = v;
+    }
+  }
+}
+
+struct MoeVerifyState {
+  const OrtApi& api;
+  int topk;
+  MoeVerifyState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
+    Ort::ConstKernelInfo k(info);
+    topk = static_cast<int>(k.GetAttribute<int64_t>("topk"));
+  }
+  OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
+    try {
+      Ort::KernelContext c(raw);
+      auto z = c.GetInput(0);
+      const int R = static_cast<int>(Dim(z, 0));
+      const int P = R * topk;
+      if (R < 1 || R > 8 || P > 128) throw std::invalid_argument("MoeVerify: rows must be in [1,8] and rows*topk <= 128");
+      if (Dim(z, 1) != 1024) throw std::invalid_argument("MoeVerify: latent size must be 1024");
+      const int I = static_cast<int>(Dim(c.GetInput(3), 1));  // fc1_w [E, I, 512]
+      if (I % 64 != 0) throw std::invalid_argument("MoeVerify: inter size must be a multiple of 64");
+      auto out = c.GetOutput(0, std::vector<int64_t>{R, 1024});
+      auto h = c.GetOutput(1, std::vector<int64_t>{P, I});
+      auto part = c.GetOutput(2, std::vector<int64_t>{P, 1024});
+      auto meta = c.GetOutput(3, std::vector<int64_t>{1 + P + P * 8});
+      cudaStream_t s = Stream(api, raw);
+      int* mp = Out<int>(meta);
+      MoeGroupKernel<<<1, 128, 0, s>>>(In<int>(c, 1), P, topk, mp);
+      constexpr int MT1 = 2, KW1 = 4, MT2 = 2, KW2 = 8;
+      MoeMmaKernel<1, MT1, KW1><<<dim3(I / (16 * MT1), P), KW1 * 32, KW1 * MT1 * 16 * 8 * sizeof(float), s>>>(
+          In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
+      MoeMmaKernel<2, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
+          Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+      MoeFinalizeKernel<<<R, 256, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
+      CheckLaunch();
+      return nullptr;
+    } catch (const std::exception& e) {
+      return api.CreateStatus(ORT_FAIL, e.what());
+    }
+  }
+};
+
 struct Nvfp4GemvState {
   const OrtApi& api;
   Nvfp4GemvState(const OrtApi& a, const OrtKernelInfo*) : api(a) {}
@@ -638,6 +981,11 @@ struct Nvfp4GemvState {
       const uint8_t* sp = In<uint8_t>(c, 2);
       const float* gp = In<float>(c, 3);
       bf16* yp = Out<bf16>(y);
+      if (R >= 2 && R <= 8 && K % 64 == 0) {
+        LaunchMmaGemv<kFmtFp4>(xp, wp, sp, gp, R, N, K, yp, s);
+        CheckLaunch();
+        return nullptr;
+      }
       switch (R) {
         case 1: LaunchNvfp4<1>(xp, wp, sp, gp, N, K, yp, s); break;
         case 2: LaunchNvfp4<2>(xp, wp, sp, gp, N, K, yp, s); break;
@@ -798,7 +1146,12 @@ struct QGemvState {
       if (K % 32 != 0 || Dim(w, 1) * 32 != K) throw std::invalid_argument("QGemv: K mismatch");
       shape.back() = N;
       auto y = c.GetOutput(0, shape);
-      LaunchQGemv<BITS>(R, In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), N, K, Out<bf16>(y), Stream(api, raw));
+      if (R >= 2 && R <= 8 && K % 64 == 0) {
+        LaunchMmaGemv<BITS == 8 ? kFmtQ8 : kFmtQ4>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K,
+                                                   Out<bf16>(y), Stream(api, raw));
+      } else {
+        LaunchQGemv<BITS>(R, In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), N, K, Out<bf16>(y), Stream(api, raw));
+      }
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -882,6 +1235,19 @@ struct MoeDecodeOp : BoltOp<MoeDecodeOp, MoeDecodeState> {
     return t[i];
   }
 };
+struct MoeVerifyOp : BoltOp<MoeVerifyOp, MoeVerifyState> {
+  const char* GetName() const { return "MoeVerify"; }
+  size_t GetInputTypeCount() const { return 7; }
+  ONNXTensorElementDataType GetInputType(size_t i) const {
+    static const ONNXTensorElementDataType t[7] = {BF, I32, F32, U8, BF, U8, BF};
+    return t[i];
+  }
+  size_t GetOutputTypeCount() const { return 4; }
+  ONNXTensorElementDataType GetOutputType(size_t i) const {
+    static const ONNXTensorElementDataType t[4] = {BF, BF, F32, I32};
+    return t[i];
+  }
+};
 struct Relu2Op : BoltOp<Relu2Op, Relu2State> {
   const char* GetName() const { return "Relu2"; }
   size_t GetInputTypeCount() const { return 1; }
@@ -926,6 +1292,7 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
     static MambaVerifyOp mamba_verify;
     static MoeRouteOp route;
     static MoeDecodeOp moe_decode;
+    static MoeVerifyOp moe_verify;
     static Relu2Op relu2;
     static Nvfp4GemvOp fp4;
     static Q8GemvOp q8;
@@ -937,6 +1304,7 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
       domain.Add(&mamba_verify);
       domain.Add(&route);
       domain.Add(&moe_decode);
+      domain.Add(&moe_verify);
       domain.Add(&relu2);
       domain.Add(&fp4);
       domain.Add(&q8);
