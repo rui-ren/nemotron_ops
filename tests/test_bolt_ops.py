@@ -195,6 +195,39 @@ def test_mamba(R, heads=128, hd=64, ds=128, ng=8):
     assert rel(y, ref) < 1e-2 and rel(ss_o[0], st) < 1e-4 and rel(cs_o[0], inp[-3:].T) < 1e-6
 
 
+def test_mamba_verify(R=8, sel=3, heads=128, hd=64, ds=128, ng=8):
+    """MambaVerify: starts from state row `sel` of a [R, ...] buffer, writes the state after token r to row r."""
+    torch.manual_seed(7)
+    di = heads * hd
+    cd = di + 2 * ng * ds
+    proj = (torch.randn(R, di + cd + heads) * 0.7).bfloat16()
+    cst = (torch.randn(R, cd, 3) * 0.5).bfloat16()
+    sst = torch.randn(R, heads, ds, hd) * 0.1
+    cw = (torch.randn(cd, 1, 4) * 0.3).bfloat16()
+    cb = (torch.randn(cd) * 0.1).bfloat16()
+    dtb = torch.randn(heads) * 0.3
+    an = -torch.rand(heads) * 4 - 0.1
+    D = torch.randn(heads)
+    nw = torch.rand(di) + 0.5
+    ins = [("proj", proj), ("cs", cst), ("ss", sst), ("cw", cw), ("cb", cb), ("dtb", dtb), ("an", an), ("D", D), ("nw", nw),
+           ("sel", torch.tensor([sel], dtype=torch.int32))]
+    outs = run("MambaVerify", [(n, t.to(DEV)) for n, t in ins], [BF, BF, F32, BF, F32],
+               {"heads": heads, "head_dim": hd, "d_state": ds, "n_groups": ng, "epsilon": 1e-5, "time_step_min": 0.001})
+    y_v, cs_all, ss_all = outs[0].cpu(), outs[1].cpu(), outs[2].cpu()
+    # reference: the stock single-state op run row by row, then compared against every row's state
+    st_conv, st_ssm = cst[sel:sel + 1].clone(), sst[sel:sel + 1].clone()
+    ys = []
+    for r in range(R):
+        ins1 = [("proj", proj[r:r + 1]), ("cs", st_conv), ("ss", st_ssm), ("cw", cw), ("cb", cb), ("dtb", dtb), ("an", an), ("D", D), ("nw", nw)]
+        y, cs_o, ss_o, _, _ = run("MambaStep", [(n, t.to(DEV)) for n, t in ins1], [BF, BF, F32, BF, F32],
+                                  {"heads": heads, "head_dim": hd, "d_state": ds, "n_groups": ng, "epsilon": 1e-5, "time_step_min": 0.001})
+        st_conv, st_ssm = cs_o.cpu(), ss_o.cpu()
+        ys.append(y.cpu())
+        assert rel(ss_all[r], st_ssm[0]) < 1e-5 and rel(cs_all[r], st_conv[0]) < 1e-6, r
+    print(f"MambaVerify R={R} sel={sel}: y rel err {rel(y_v, torch.cat(ys)):.2e}, all per-row states match")
+    assert rel(y_v, torch.cat(ys)) < 1e-4
+
+
 if __name__ == "__main__":
     for R in (1, 2, 8):
         test_nvfp4(R, 18560, 4096)
@@ -210,4 +243,6 @@ if __name__ == "__main__":
         test_moe_decode(R, E, I)
     for R in (1, 2, 8, 16):
         test_mamba(R)
+    test_mamba_verify(8, 3)
+    test_mamba_verify(5, 0)
     print("all passed")

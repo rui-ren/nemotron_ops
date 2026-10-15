@@ -22,6 +22,7 @@ BOLT_PLUGIN=<libonnxruntime_providers_cuda.so of the CUDA plugin EP> BOLT_OPS=bu
 | op | what it replaces | inputs -> outputs |
 | --- | --- | --- |
 | `MambaStep` | the ~35-node chain between `in_proj` and `out_proj` of a Mamba2 layer (Transpose, `CausalConvWithState`, Split, dt/softplus/clamp, `LinearAttention[gated]`, D skip, gated grouped RMSNorm, casts), R <= 16 rows | proj `[R,18560]`, conv_state `[1,10240,3]`, ssm_state `[1,128,128,64]` f32, conv_w, conv_b, dt_bias, A_neg, D, norm_w -> y `[R,8192]`, conv_state', ssm_state' (+2 scratch). State outputs may alias the state inputs. |
+| `MambaVerify` | `MambaStep` for speculative verification: states are `[Rs>=R, ...]` buffers, input 9 `state_row` (int32 `[1]`, device) selects the starting state and the state after token r is written to row r (in-place safe) | as `MambaStep` + `state_row` |
 | `MoeRoute` | fp32 router (`MatMul`, sigmoid, bias-corrected `TopK`, `GatherElements`, normalise, x5, scatter to the dense QMoE inputs) | x `[R,4096]`, gate_w `[E,4096]` bf16, bias `[E]` f32 -> idx `[R,k]` i32, w `[R,k]` f32 (+scores) |
 | `MoeDecode` | `QMoE` for R <= 8 rows (relu2 experts, latent size 1024, int4 block-32 raw `[E,N,K/2]` weights + bf16 scales, zero point 8) | z `[R,1024]`, idx, w, fc1_w, fc1_s, fc2_w, fc2_s -> out `[R,1024]` (+2 scratch) |
 | `Nvfp4Gemv` | modelopt NVFP4 linear (u8 `[N,K/2]`, fp8 e4m3 block-16 scales, fp32 global scale), R <= 8 rows, K in {4096, 8192}; fp16x2 FMA on rescaled e2m1 patterns | x, w, w_scale (u8 view), global scale -> y |

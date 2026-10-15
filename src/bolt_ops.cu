@@ -63,9 +63,11 @@ int64_t Count(const Ort::ConstValue& v) {
 __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R, int proj_stride, int di, int conv_dim,
                                 const bf16* __restrict__ conv_state_in, const bf16* __restrict__ conv_w,
                                 const bf16* __restrict__ conv_b, bf16* __restrict__ conv_state_out,
-                                bf16* __restrict__ xbc_act) {
+                                bf16* __restrict__ xbc_act, const int* __restrict__ sel, bool all_rows) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= conv_dim) return;
+  // Verify mode: the input state is row `sel` of a [rows, conv_dim, 3] buffer and the state after token r goes to row r.
+  if (sel) conv_state_in += static_cast<int64_t>(*sel) * conv_dim * 3;
   float inp[3 + kMaxRows];
   inp[0] = B2F(conv_state_in[c * 3 + 0]);
   inp[1] = B2F(conv_state_in[c * 3 + 1]);
@@ -78,9 +80,18 @@ __global__ void MambaConvKernel(const bf16* __restrict__ proj, int R, int proj_s
     float acc = bias + w0 * inp[r] + w1 * inp[r + 1] + w2 * inp[r + 2] + w3 * inp[r + 3];
     xbc_act[static_cast<int64_t>(r) * conv_dim + c] = __float2bfloat16(Silu(acc));
   }
-  conv_state_out[c * 3 + 0] = __float2bfloat16(inp[R]);
-  conv_state_out[c * 3 + 1] = __float2bfloat16(inp[R + 1]);
-  conv_state_out[c * 3 + 2] = __float2bfloat16(inp[R + 2]);
+  if (all_rows) {
+    for (int r = 0; r < R; ++r) {
+      bf16* o = conv_state_out + (static_cast<int64_t>(r) * conv_dim + c) * 3;
+      o[0] = __float2bfloat16(inp[r + 1]);
+      o[1] = __float2bfloat16(inp[r + 2]);
+      o[2] = __float2bfloat16(inp[r + 3]);
+    }
+  } else {
+    conv_state_out[c * 3 + 0] = __float2bfloat16(inp[R]);
+    conv_state_out[c * 3 + 1] = __float2bfloat16(inp[R + 1]);
+    conv_state_out[c * 3 + 2] = __float2bfloat16(inp[R + 2]);
+  }
 }
 
 // One block per head. State layout [heads, ds, hd] (hd contiguous), fp32. Thread (p, half) owns state[n in half][p].
@@ -89,7 +100,8 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_st
                                int heads_per_group, const bf16* __restrict__ xbc_act,
                                const float* __restrict__ ssm_in, const float* __restrict__ dt_bias,
                                const float* __restrict__ a_neg, const float* __restrict__ d_skip, float tmin,
-                               float* __restrict__ ssm_out, float* __restrict__ ypre) {
+                               float* __restrict__ ssm_out, float* __restrict__ ypre, const int* __restrict__ sel,
+                               bool all_rows) {
   const int h = blockIdx.x;
   const int g = h / heads_per_group;
   const int tid = threadIdx.x;
@@ -114,7 +126,8 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_st
   }
   __syncthreads();
   float st[NH];
-  const float* sp = ssm_in + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+  const int64_t row_stride = static_cast<int64_t>(heads) * DS * HD;
+  const float* sp = ssm_in + (sel ? static_cast<int64_t>(*sel) * row_stride : 0) + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
 #pragma unroll
   for (int n = 0; n < NH; ++n) st[n] = sp[static_cast<int64_t>(n) * HD];
   const float A = a_neg[h];
@@ -132,10 +145,17 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_st
       acc += sC[r][nn] * st[n];
     }
     sPart[r][half][p] = acc;
-  }
-  float* op = ssm_out + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+    if (all_rows) {
+      float* orow = ssm_out + r * row_stride + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
 #pragma unroll
-  for (int n = 0; n < NH; ++n) op[static_cast<int64_t>(n) * HD] = st[n];
+      for (int n = 0; n < NH; ++n) orow[static_cast<int64_t>(n) * HD] = st[n];
+    }
+  }
+  if (!all_rows) {
+    float* op = ssm_out + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+#pragma unroll
+    for (int n = 0; n < NH; ++n) op[static_cast<int64_t>(n) * HD] = st[n];
+  }
   __syncthreads();
   for (int i = tid; i < R * HD; i += blockDim.x) {
     const int r = i / HD, pp = i % HD;
@@ -178,7 +198,8 @@ struct MambaStepState {
   const OrtApi& api;
   int heads, hd, ds, ng;
   float eps, tmin;
-  MambaStepState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
+  bool verify;
+  MambaStepState(const OrtApi& a, const OrtKernelInfo* info, bool verify_mode = false) : api(a), verify(verify_mode) {
     Ort::ConstKernelInfo k(info);
     heads = static_cast<int>(k.GetAttribute<int64_t>("heads"));
     hd = static_cast<int>(k.GetAttribute<int64_t>("head_dim"));
@@ -199,6 +220,8 @@ struct MambaStepState {
       const int stride = di + conv_dim + heads;
       if (Dim(proj, 1) != stride) throw std::invalid_argument("MambaStep: bad proj width");
       auto y = c.GetOutput(0, std::vector<int64_t>{R, di});
+      const int* sel = verify ? In<int>(c, 9) : nullptr;
+      if (verify && Dim(c.GetInput(1), 0) < R) throw std::invalid_argument("MambaVerify: state buffer needs >= R rows");
       auto conv_out = c.GetOutput(1, c.GetInput(1).GetTensorTypeAndShapeInfo().GetShape());
       auto ssm_out = c.GetOutput(2, c.GetInput(2).GetTensorTypeAndShapeInfo().GetShape());
       auto xbc_act = c.GetOutput(3, std::vector<int64_t>{R, conv_dim});
@@ -206,11 +229,11 @@ struct MambaStepState {
       cudaStream_t s = Stream(api, raw);
       MambaConvKernel<<<(conv_dim + 127) / 128, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
                                                            In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
-                                                           Out<bf16>(xbc_act));
+                                                           Out<bf16>(xbc_act), sel, verify);
       MambaSsmKernel<128, 64><<<heads, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
                                                      Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
                                                      In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
-                                                     Out<float>(ypre));
+                                                     Out<float>(ypre), sel, verify);
       MambaNormKernel<<<dim3(R, ng), 256, 0, s>>>(In<bf16>(c, 0), stride, di, di / ng, eps, Out<float>(ypre),
                                                   In<float>(c, 8), Out<bf16>(y));
       CheckLaunch();
@@ -817,6 +840,24 @@ struct MambaStepOp : BoltOp<MambaStepOp, MambaStepState> {
     return t[i];
   }
 };
+// MambaVerify: MambaStep for speculative verification. The state buffers hold one state per row ([Rs, ...], Rs >= R): the
+// op starts from row `state_row` (int32 [1], device) and writes the state after token r into row r.
+struct MambaVerifyState : MambaStepState {
+  MambaVerifyState(const OrtApi& a, const OrtKernelInfo* info) : MambaStepState(a, info, true) {}
+};
+struct MambaVerifyOp : BoltOp<MambaVerifyOp, MambaVerifyState> {
+  const char* GetName() const { return "MambaVerify"; }
+  size_t GetInputTypeCount() const { return 10; }
+  ONNXTensorElementDataType GetInputType(size_t i) const {
+    static const ONNXTensorElementDataType t[10] = {BF, BF, F32, BF, BF, F32, F32, F32, F32, I32};
+    return t[i];
+  }
+  size_t GetOutputTypeCount() const { return 5; }
+  ONNXTensorElementDataType GetOutputType(size_t i) const {
+    static const ONNXTensorElementDataType t[5] = {BF, BF, F32, BF, F32};
+    return t[i];
+  }
+};
 struct MoeRouteOp : BoltOp<MoeRouteOp, MoeRouteState> {
   const char* GetName() const { return "MoeRoute"; }
   size_t GetInputTypeCount() const { return 3; }
@@ -882,6 +923,7 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
   Ort::InitApi(api);
   try {
     static MambaStepOp mamba;
+    static MambaVerifyOp mamba_verify;
     static MoeRouteOp route;
     static MoeDecodeOp moe_decode;
     static Relu2Op relu2;
@@ -892,6 +934,7 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
     static std::once_flag registered;
     std::call_once(registered, [&]() {
       domain.Add(&mamba);
+      domain.Add(&mamba_verify);
       domain.Add(&route);
       domain.Add(&moe_decode);
       domain.Add(&relu2);
