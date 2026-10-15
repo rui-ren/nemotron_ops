@@ -1,0 +1,212 @@
+"""Unit tests of the bolt custom ops against torch references.
+
+usage: BOLT_PLUGIN=<cuda plugin ep .so> BOLT_OPS=<libbolt_ops.so> python tests/test_bolt_ops.py
+"""
+import os
+import sys
+
+import numpy as np
+import onnx
+import onnxruntime as ort
+import torch
+from onnx import TensorProto as TP
+from onnx import helper
+
+BF, F32, U8, I32 = TP.BFLOAT16, TP.FLOAT, TP.UINT8, TP.INT32
+DEV = "cuda:0"
+_registered = False
+
+
+def session(model):
+    global _registered
+    plugin = os.environ["BOLT_PLUGIN"]
+    if not _registered:
+        ort.register_execution_provider_library("CUDAExecutionProvider", plugin)
+        _registered = True
+    so = ort.SessionOptions()
+    so.register_custom_ops_library(os.environ["BOLT_OPS"])
+    devs = [d for d in ort.get_ep_devices() if d.ep_name == "CUDAExecutionProvider" and d.ep_metadata.get("cuda_device_id") == "0"]
+    so.add_provider_for_devices(devs, {})
+    return ort.InferenceSession(model.SerializeToString(), sess_options=so)
+
+
+def vi(n, t, shape):
+    return helper.make_tensor_value_info(n, t, shape)
+
+
+def run(op, inputs, out_types, attrs=None):
+    """inputs: list of (name, torch tensor on cuda); returns list of torch tensors."""
+    m = {torch.bfloat16: BF, torch.float32: F32, torch.uint8: U8, torch.int32: I32}
+    outs = [f"o{i}" for i in range(len(out_types))]
+    node = helper.make_node(op, [n for n, _ in inputs], outs, domain="bolt", **(attrs or {}))
+    g = helper.make_graph([node], "t", [vi(n, m[t.dtype], list(t.shape)) for n, t in inputs],
+                          [vi(o, ot, None) for o, ot in zip(outs, out_types)])
+    model = helper.make_model(g, opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("bolt", 1)])
+    model.ir_version = 10
+    sess = session(model)
+    b = sess.io_binding()
+    keep = []
+    for n, t in inputs:
+        ov = ort.OrtValue.from_dlpack(t.contiguous().__dlpack__())
+        keep.append(ov)
+        b.bind_ortvalue_input(n, ov)
+    for o in outs:
+        b.bind_output(o, "cuda", 0)
+    sess.run_with_iobinding(b)
+    b.synchronize_outputs()
+    return [torch.from_dlpack(o) for o in b.get_outputs()]
+
+
+def rel(a, b):
+    a, b = a.float().cpu(), b.float().cpu()
+    return ((a - b).norm() / b.norm().clamp_min(1e-12)).item()
+
+
+FP4 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+
+
+def test_nvfp4(R, N, K):
+    torch.manual_seed(1)
+    w = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8)
+    ws = torch.randint(0x30, 0x48, (N, K // 16), dtype=torch.uint8)  # e4m3 bytes, positive small range
+    g = torch.tensor([0.37])
+    x = torch.randn(R, K).bfloat16() * 2
+    deq = torch.stack([FP4[(w & 15).long()], FP4[(w >> 4).long()]], -1).reshape(N, K)
+    s = ws.view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)
+    ref = x.float() @ (deq * s * g).T
+    (y,) = run("Nvfp4Gemv", [("x", x.to(DEV)), ("w", w.to(DEV)), ("ws", ws.to(DEV)), ("g", g.to(DEV))], [BF])
+    print(f"Nvfp4Gemv R={R} N={N} K={K}: rel err {rel(y, ref):.2e}")
+    assert rel(y, ref) < 1e-2
+
+
+def test_qgemv(bits, R, N, K):
+    torch.manual_seed(2)
+    nb = K // 32
+    if bits == 8:
+        q = torch.randint(0, 256, (N, nb, 32), dtype=torch.uint8)
+        deq = q.float() - 128
+    else:
+        q = torch.randint(0, 256, (N, nb, 16), dtype=torch.uint8)
+        deq = torch.stack([(q & 15).float(), (q >> 4).float()], -1).reshape(N, nb, 32) - 8
+    sc = (torch.rand(N, nb) * 0.02).bfloat16()
+    x = torch.randn(R, K).bfloat16()
+    ref = x.float() @ (deq * sc.float().unsqueeze(-1)).reshape(N, K).T
+    (y,) = run("Q8Gemv" if bits == 8 else "Q4Gemv", [("x", x.to(DEV)), ("w", q.to(DEV)), ("s", sc.to(DEV))], [BF])
+    print(f"Q{bits}Gemv R={R} N={N} K={K}: rel err {rel(y, ref):.2e}")
+    assert rel(y, ref) < 1e-2
+
+
+def test_relu2():
+    x = torch.randn(3, 1000).bfloat16() * 3
+    (y,) = run("Relu2", [("x", x.to(DEV))], [BF])
+    ref = (torch.relu(x).float() ** 2).bfloat16()
+    print("Relu2: max diff", (y.cpu().float() - ref.float()).abs().max().item())
+    assert torch.equal(y.cpu(), ref)
+
+
+def test_route(R, E, topk=9, K=4096):
+    torch.manual_seed(3)
+    x = torch.randn(R, K).bfloat16()
+    w = (torch.randn(E, K) * 0.05).bfloat16()
+    b = torch.randn(E) * 0.1
+    idx, wt, _ = run("MoeRoute", [("x", x.to(DEV)), ("w", w.to(DEV)), ("b", b.to(DEV))], [I32, F32, F32],
+                     {"topk": topk, "scale": 5.0})
+    sc = (x.float() @ w.float().T).sigmoid()
+    ridx = torch.topk(sc + b, topk, dim=-1)[1]
+    rw = sc.gather(1, ridx)
+    rw = rw / (rw.sum(-1, keepdim=True) + 1e-20) * 5.0
+    same = all(set(idx[r].cpu().tolist()) == set(ridx[r].tolist()) for r in range(R))
+    # compare weights per expert
+    got = torch.zeros(R, E); ref = torch.zeros(R, E)
+    got.scatter_(1, idx.cpu().long(), wt.cpu()); ref.scatter_(1, ridx, rw)
+    print(f"MoeRoute R={R} E={E}: same experts {same}, weight rel err {rel(got, ref):.2e}")
+    assert same and rel(got, ref) < 1e-3
+
+
+def test_moe_decode(R, E, I, topk=9):
+    torch.manual_seed(4)
+    z = (torch.randn(R, 1024) * 0.5).bfloat16()
+    idx = torch.stack([torch.randperm(E)[:topk] for _ in range(R)]).int()
+    w = torch.rand(R, topk)
+    w1 = torch.randint(0, 256, (E, I, 512), dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (E, 1024, I // 2), dtype=torch.uint8)
+    s1 = (torch.rand(E, I, 32) * 0.003).bfloat16()
+    s2 = (torch.rand(E, 1024, I // 32) * 0.003).bfloat16()
+
+    def deq(q, s, n, k):
+        v = torch.stack([(q & 15).float(), (q >> 4).float()], -1).reshape(q.shape[0], n, k // 32, 32) - 8
+        return (v * s.float().unsqueeze(-1)).reshape(q.shape[0], n, k)
+
+    d1, d2 = deq(w1, s1, I, 1024), deq(w2, s2, 1024, I)
+    ref = torch.zeros(R, 1024)
+    for t in range(R):
+        for j in range(topk):
+            e = idx[t, j]
+            h = (z[t].float() @ d1[e].T).bfloat16().float()
+            h = (torch.relu(h) ** 2).bfloat16().float()
+            ref[t] += w[t, j] * (h @ d2[e].T).bfloat16().float()
+    out = run("MoeDecode", [("z", z.to(DEV)), ("i", idx.to(DEV)), ("w", w.to(DEV)), ("w1", w1.to(DEV)), ("s1", s1.to(DEV)),
+                            ("w2", w2.to(DEV)), ("s2", s2.to(DEV))], [BF, BF, F32], {"topk": topk})[0]
+    print(f"MoeDecode R={R} E={E} I={I}: rel err {rel(out, ref):.2e}")
+    assert rel(out, ref) < 1e-2
+
+
+def test_mamba(R, heads=128, hd=64, ds=128, ng=8):
+    torch.manual_seed(5)
+    di = heads * hd
+    cd = di + 2 * ng * ds
+    proj = (torch.randn(R, di + cd + heads) * 0.7).bfloat16()
+    cst = (torch.randn(1, cd, 3) * 0.5).bfloat16()
+    sst = torch.randn(1, heads, ds, hd) * 0.1
+    cw = (torch.randn(cd, 1, 4) * 0.3).bfloat16()
+    cb = (torch.randn(cd) * 0.1).bfloat16()
+    dtb = torch.randn(heads) * 0.3
+    an = -torch.rand(heads) * 4 - 0.1
+    D = torch.randn(heads)
+    nw = torch.rand(di) + 0.5
+    ins = [("proj", proj), ("cs", cst), ("ss", sst), ("cw", cw), ("cb", cb), ("dtb", dtb), ("an", an), ("D", D), ("nw", nw)]
+    y, cs_o, ss_o, _, _ = run("MambaStep", [(n, t.to(DEV)) for n, t in ins], [BF, BF, F32, BF, F32],
+                              {"heads": heads, "head_dim": hd, "d_state": ds, "n_groups": ng, "epsilon": 1e-5, "time_step_min": 0.001})
+    # reference
+    gate, xbc, dt = proj.split([di, cd, heads], -1)
+    inp = torch.cat([cst[0].T.float(), xbc.float()], 0)  # [3+R, cd]
+    conv = torch.zeros(R, cd)
+    for r in range(R):
+        win = inp[r:r + 4]  # [4, cd]
+        conv[r] = torch.nn.functional.silu((win * cw[:, 0, :].T.float()).sum(0) + cb.float())
+    conv = conv.bfloat16().float()
+    xs, Bm, Cm = conv.split([di, ng * ds, ng * ds], -1)
+    st = sst[0].clone()
+    ys = []
+    for r in range(R):
+        dts = torch.clamp(torch.nn.functional.softplus(dt[r].float() + dtb), min=0.001)
+        dA = torch.exp(an * dts)
+        xh = xs[r].reshape(heads, hd)
+        Bh = Bm[r].reshape(ng, ds).repeat_interleave(heads // ng, 0)
+        Ch = Cm[r].reshape(ng, ds).repeat_interleave(heads // ng, 0)
+        st = st * dA[:, None, None] + (dts[:, None] * xh)[:, None, :] * Bh[:, :, None]
+        ys.append((st * Ch[:, :, None]).sum(1) + D[:, None] * xh)
+    yp = torch.stack(ys).reshape(R, di)
+    g = yp * torch.nn.functional.silu(gate.float())
+    g = g.reshape(R, ng, di // ng)
+    g = g * torch.rsqrt(g.pow(2).mean(-1, keepdim=True) + 1e-5)
+    ref = (g.reshape(R, di) * nw)
+    print(f"MambaStep R={R}: y rel err {rel(y, ref):.2e}, ssm {rel(ss_o[0], st):.2e}, conv {rel(cs_o[0], inp[-3:].T):.2e}")
+    assert rel(y, ref) < 1e-2 and rel(ss_o[0], st) < 1e-4 and rel(cs_o[0], inp[-3:].T) < 1e-6
+
+
+if __name__ == "__main__":
+    for R in (1, 2, 8):
+        test_nvfp4(R, 18560, 4096)
+    test_nvfp4(1, 4096, 8192)
+    for bits in (8, 4):
+        for R, N, K in ((1, 1024, 4096), (1, 4096, 1024), (4, 4096, 5376), (1, 131072, 4096)):
+            test_qgemv(bits, R, N, K)
+    test_relu2()
+    for R, E in ((1, 240), (4, 496), (8, 304)):
+        test_route(R, E)
+    for R, E, I in ((1, 240, 2048), (2, 304, 2304), (1, 496, 2560)):
+        test_moe_decode(R, E, I)
+    for R in (1, 2, 8, 16):
+        test_mamba(R)
+    print("all passed")
