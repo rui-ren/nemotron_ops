@@ -27,6 +27,19 @@ BOLT_PLUGIN=<libonnxruntime_providers_cuda.so of the CUDA plugin EP> BOLT_OPS=bu
 | `MoeDecode` | `QMoE` for R <= 8 rows (relu2 experts, latent size 1024, int4 block-32 raw `[E,N,K/2]` weights + bf16 scales, zero point 8) | z `[R,1024]`, idx, w, fc1_w, fc1_s, fc2_w, fc2_s -> out `[R,1024]` (+2 scratch) |
 | `Nvfp4Gemv` | modelopt NVFP4 linear (u8 `[N,K/2]`, fp8 e4m3 block-16 scales, fp32 global scale), R <= 8 rows, K in {4096, 8192}; fp16x2 FMA on rescaled e2m1 patterns | x, w, w_scale (u8 view), global scale -> y |
 | `Q8Gemv` / `Q4Gemv` | `MatMulNBits` bits=8 / bits=4, block 32, symmetric (Q8_0 / IQ2_XXS-derived weights), bf16 scales, R <= 8 | x, B `[N,K/32,32 or 16]`, scales `[N,K/32]` -> y |
+| `MoeVerify` | `MoeDecode` for R <= 8 rows (speculative verification): (token, expert) pairs are grouped by expert, each unique expert's int4 weights are read once and applied to all rows with tensor-core MMAs | as `MoeDecode` + an int32 scratch output (expert groups) |
 | `Relu2` | `Relu` + `Mul` | x -> bf16(relu(x)^2) |
 
 All numerics follow the bf16/fp32 rounding points of the ONNX chains they replace (see the header of `src/bolt_ops.cu`).
+
+## Multi-row (speculative verify) path
+
+`Nvfp4Gemv`, `Q8Gemv`, `Q4Gemv` (2 <= R <= 8, K % 64 == 0) and `MoeVerify` use `mma.m16n8k16` (bf16 in, fp32 accumulate): a warp owns 16 weight rows,
+the (<= 8) activation rows are the MMA's N dimension, weights are dequantised in registers straight from the checkpoint layout (no repacking; mma sums over k, so
+k is permuted consistently between weights and activations). Weights become bf16 (`(q - zp) * scale` rounded once, like ORT's `MatMulNBits` dequantisation; NVFP4
+is exact), the fp32 accumulation replaces the old fp16 partial sums. R = 1 keeps the dedicated GEMV kernels. Debug knobs: `BOLT_GEMV_CFG`, `BOLT_MOE_CFG`.
+
+`MambaVerify`: states are `[Rs, ...]` buffers; input 9 (`state_row`, device int32) selects the start state and row r receives the state after token r, so rejected
+draft tokens need no rollback copy.
+
+Benchmarks: `tools/bench_gemv.py`, `tools/bench_moe.py` (eager, so kernels below ~10 us are launch-bound there; use nsys for those).

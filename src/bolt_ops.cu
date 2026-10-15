@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <type_traits>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -646,19 +648,38 @@ __device__ __forceinline__ float ByteToMagic(uint32_t w, int s) {
   return __uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | s));
 }
 
-template <int FMT>
+// WIDE (int4 / fp4 only): a thread loads 16 bytes = 32 k of a row per chunk (chunk = 128 k, 64 contiguous bytes per row for
+// the 4 threads t) instead of 8 bytes; the two 16-k halves are consumed as two MMA groups.
+template <int FMT, bool WIDE>
 __device__ __forceinline__ void LoadWeightRow(const uint8_t* w, const void* sc, int64_t row, int K, int c, int t, uint4& raw,
-                                              float& scale) {
+                                              float* scale) {
   if constexpr (FMT == kFmtQ8) {
     raw = __ldg(reinterpret_cast<const uint4*>(w + row * K + 64 * c + 16 * t));
-    scale = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
-  } else {
+    scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
+  } else if constexpr (!WIDE) {
     const uint2 v = __ldg(reinterpret_cast<const uint2*>(w + row * (K / 2) + 32 * c + 8 * t));
     raw = make_uint4(v.x, v.y, 0u, 0u);
-    if constexpr (FMT == kFmtQ4) scale = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
-    else scale = Fp8E4M3ToFloat(reinterpret_cast<const uint8_t*>(sc)[row * (K / 16) + 4 * c + t]);
+    if constexpr (FMT == kFmtQ4) scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
+    else scale[0] = Fp8E4M3ToFloat(reinterpret_cast<const uint8_t*>(sc)[row * (K / 16) + 4 * c + t]);
+  } else {
+    raw = __ldg(reinterpret_cast<const uint4*>(w + row * (K / 2) + 64 * c + 16 * t));
+    if constexpr (FMT == kFmtQ4) {
+      scale[0] = scale[1] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 4 * c + t]);
+    } else {
+      const uint16_t two = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(sc) + row * (K / 16) + 8 * c + 2 * t);
+      scale[0] = Fp8E4M3ToFloat(two & 0xFFu);
+      scale[1] = Fp8E4M3ToFloat(two >> 8);
+    }
   }
 }
+
+template <int FMT, bool WIDE, int MT>
+struct StageT {
+  static constexpr int NH = WIDE ? 2 : 1;  // 16-k halves per thread and chunk
+  uint4 raw[MT][2];
+  float sc[MT][2][NH];
+  uint4 x[2 * NH];
+};
 
 // Dequantised bf16x2 pairs for MMA step s: lo[s] = k-slots (s, s+4), hi[s] = (8+s, 12+s).
 template <int FMT>
@@ -695,67 +716,50 @@ __device__ __forceinline__ void DequantRow(const uint4& raw, float scale, uint32
   }
 }
 
-template <int FMT, int MT, int KW>
-__global__ void __launch_bounds__(KW * 32)
-    MmaGemvKernel(const bf16* __restrict__ x, const uint8_t* __restrict__ w, const void* __restrict__ sc,
-                  const float* __restrict__ gscale, int R, int N, int K, bf16* __restrict__ y) {
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int g = lane >> 2, t = lane & 3;
-  const int nchunks = K / 64;
-  const int64_t n_base = static_cast<int64_t>(blockIdx.x) * (MT * 16);
-  const bf16* xr = x + static_cast<int64_t>(min(g, R - 1)) * K;
-  const bool xvalid = g < R;
+// Loads the x fragments of one chunk: 16 (or 32) contiguous k of activation row g for this thread.
+template <int NH>
+__device__ __forceinline__ void LoadX(const bf16* xr, bool valid, int c, int t, uint4* xo) {
+  const uint4* xp = reinterpret_cast<const uint4*>(xr + 64 * NH * c + 16 * NH * t);
+#pragma unroll
+  for (int i = 0; i < 2 * NH; ++i) xo[i] = valid ? __ldg(xp + i) : make_uint4(0, 0, 0, 0);
+}
 
-  struct Stage {
-    uint4 raw[MT][2];
-    float sc[MT][2];
-    uint4 xa, xb;
-  };
-  float acc[MT][4];
+template <int FMT, bool WIDE, int MT>
+__device__ __forceinline__ void ComputeStage(const StageT<FMT, WIDE, MT>& st, float (*acc)[4]) {
 #pragma unroll
-  for (int m = 0; m < MT; ++m)
-#pragma unroll
-    for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
-
-  auto load = [&](int c, Stage& st) {
-#pragma unroll
-    for (int m = 0; m < MT; ++m)
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int64_t row = min(n_base + m * 16 + g + 8 * h, static_cast<int64_t>(N - 1));
-        LoadWeightRow<FMT>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
-      }
-    const uint4* xp = reinterpret_cast<const uint4*>(xr + 64 * c + 16 * t);
-    st.xa = xvalid ? __ldg(xp) : make_uint4(0, 0, 0, 0);
-    st.xb = xvalid ? __ldg(xp + 1) : make_uint4(0, 0, 0, 0);
-  };
-
-  Stage cur, nxt;
-  int c = warp;
-  if (c < nchunks) load(c, cur);
-  for (; c < nchunks; c += KW) {
-    if (c + KW < nchunks) load(c + KW, nxt);
+  for (int h = 0; h < StageT<FMT, WIDE, MT>::NH; ++h) {
+    const uint4 xa = st.x[2 * h], xb = st.x[2 * h + 1];
     uint32_t bl[4], bh[4];
-    bl[0] = __byte_perm(cur.xa.x, cur.xa.z, 0x5410);
-    bl[1] = __byte_perm(cur.xa.x, cur.xa.z, 0x7632);
-    bl[2] = __byte_perm(cur.xa.y, cur.xa.w, 0x5410);
-    bl[3] = __byte_perm(cur.xa.y, cur.xa.w, 0x7632);
-    bh[0] = __byte_perm(cur.xb.x, cur.xb.z, 0x5410);
-    bh[1] = __byte_perm(cur.xb.x, cur.xb.z, 0x7632);
-    bh[2] = __byte_perm(cur.xb.y, cur.xb.w, 0x5410);
-    bh[3] = __byte_perm(cur.xb.y, cur.xb.w, 0x7632);
+    bl[0] = __byte_perm(xa.x, xa.z, 0x5410);
+    bl[1] = __byte_perm(xa.x, xa.z, 0x7632);
+    bl[2] = __byte_perm(xa.y, xa.w, 0x5410);
+    bl[3] = __byte_perm(xa.y, xa.w, 0x7632);
+    bh[0] = __byte_perm(xb.x, xb.z, 0x5410);
+    bh[1] = __byte_perm(xb.x, xb.z, 0x7632);
+    bh[2] = __byte_perm(xb.y, xb.w, 0x5410);
+    bh[3] = __byte_perm(xb.y, xb.w, 0x7632);
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
       uint32_t lo0[4], hi0[4], lo1[4], hi1[4];
-      DequantRow<FMT>(cur.raw[m][0], cur.sc[m][0], lo0, hi0);
-      DequantRow<FMT>(cur.raw[m][1], cur.sc[m][1], lo1, hi1);
+      uint4 r0 = st.raw[m][0], r1 = st.raw[m][1];
+      if constexpr (WIDE) {
+        if (h == 1) {
+          r0 = make_uint4(r0.z, r0.w, 0u, 0u);
+          r1 = make_uint4(r1.z, r1.w, 0u, 0u);
+        }
+      }
+      DequantRow<FMT>(r0, st.sc[m][0][h], lo0, hi0);
+      DequantRow<FMT>(r1, st.sc[m][1][h], lo1, hi1);
 #pragma unroll
       for (int s = 0; s < 4; ++s) Mma16816(acc[m], lo0[s], lo1[s], hi0[s], hi1[s], bl[s], bh[s]);
     }
-    cur = nxt;
   }
+}
 
-  extern __shared__ float red[];  // [KW][MT*16][8]
+// Block-wide reduction of the per-warp K partials (red: [KW][MT*16][8] floats) and the epilogue callback f(row_local, col, value).
+template <int MT, int KW, typename F>
+__device__ __forceinline__ void ReduceEpilogue(float (*acc)[4], int warp, int g, int t, F&& f) {
+  extern __shared__ float red[];
 #pragma unroll
   for (int m = 0; m < MT; ++m) {
     float* r0 = red + (warp * MT * 16 + m * 16 + g) * 8 + 2 * t;
@@ -765,30 +769,99 @@ __global__ void __launch_bounds__(KW * 32)
     r0[8 * 8 + 1] = acc[m][3];
   }
   __syncthreads();
-  const float gs = gscale ? gscale[0] : 1.0f;
   for (int i = threadIdx.x; i < MT * 16 * 8; i += KW * 32) {
     const int rl = i >> 3, col = i & 7;
-    if (col >= R || n_base + rl >= N) continue;
     float v = 0.f;
 #pragma unroll
     for (int k = 0; k < KW; ++k) v += red[(k * MT * 16 + rl) * 8 + col];
-    y[static_cast<int64_t>(col) * N + n_base + rl] = __float2bfloat16(v * gs);
+    f(rl, col, v);
   }
 }
 
-template <int FMT, int MT, int KW>
+// Main loop shared by the dense and the MoE kernels: UNR chunks per warp in flight, next batch issued before the current one
+// is consumed. load(c, stage) / the compute step are chunk-indexed.
+template <int FMT, bool WIDE, int MT, int KW, int UNR, typename L>
+__device__ __forceinline__ void MmaMainLoop(int warp, int nchunks, float (*acc)[4], L&& load) {
+  using Stage = StageT<FMT, WIDE, MT>;
+  Stage cur[UNR], nxt[UNR];
+  int c0 = warp;
+#pragma unroll
+  for (int j = 0; j < UNR; ++j)
+    if (c0 + j * KW < nchunks) load(c0 + j * KW, cur[j]);
+  for (; c0 < nchunks; c0 += KW * UNR) {
+#pragma unroll
+    for (int j = 0; j < UNR; ++j)
+      if (c0 + (UNR + j) * KW < nchunks) load(c0 + (UNR + j) * KW, nxt[j]);
+#pragma unroll
+    for (int j = 0; j < UNR; ++j)
+      if (c0 + j * KW < nchunks) ComputeStage<FMT, WIDE, MT>(cur[j], acc);
+#pragma unroll
+    for (int j = 0; j < UNR; ++j) cur[j] = nxt[j];
+  }
+}
+
+template <int FMT, bool WIDE, int MT, int KW, int UNR>
+__global__ void __launch_bounds__(KW * 32)
+    MmaGemvKernel(const bf16* __restrict__ x, const uint8_t* __restrict__ w, const void* __restrict__ sc,
+                  const float* __restrict__ gscale, int R, int N, int K, bf16* __restrict__ y) {
+  constexpr int NH = WIDE ? 2 : 1;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int nchunks = K / (64 * NH);
+  const int64_t n_base = static_cast<int64_t>(blockIdx.x) * (MT * 16);
+  const bf16* xr = x + static_cast<int64_t>(min(g, R - 1)) * K;
+  const bool xvalid = g < R;
+  float acc[MT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
+  MmaMainLoop<FMT, WIDE, MT, KW, UNR>(warp, nchunks, acc, [&](int c, StageT<FMT, WIDE, MT>& st) {
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int64_t row = min(n_base + m * 16 + g + 8 * h, static_cast<int64_t>(N - 1));
+        LoadWeightRow<FMT, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+      }
+    LoadX<NH>(xr, xvalid, c, t, st.x);
+  });
+  const float gs = gscale ? gscale[0] : 1.0f;
+  ReduceEpilogue<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
+    if (col < R && n_base + rl < N) y[static_cast<int64_t>(col) * N + n_base + rl] = __float2bfloat16(v * gs);
+  });
+}
+
+template <int FMT, bool WIDE, int MT, int KW, int UNR = 1>
 void LaunchMmaGemvImpl(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
                        cudaStream_t s) {
   const int blocks = (N + MT * 16 - 1) / (MT * 16);
-  MmaGemvKernel<FMT, MT, KW><<<blocks, KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(x, w, sc, gs, R, N, K, y);
+  MmaGemvKernel<FMT, WIDE, MT, KW, UNR><<<blocks, KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(x, w, sc, gs, R, N, K, y);
 }
 
 template <int FMT>
 void LaunchMmaGemv(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
                    cudaStream_t s) {
-  if (N >= 8192) LaunchMmaGemvImpl<FMT, 2, 4>(x, w, sc, gs, R, N, K, y, s);
-  else if (K >= 4096) LaunchMmaGemvImpl<FMT, 1, 8>(x, w, sc, gs, R, N, K, y, s);
-  else LaunchMmaGemvImpl<FMT, 1, 4>(x, w, sc, gs, R, N, K, y, s);
+  static const int forced = getenv("BOLT_GEMV_CFG") ? atoi(getenv("BOLT_GEMV_CFG")) : 0;  // wide*10000 + MT*1000 + KW*10 + UNR
+  const bool can_wide = FMT != kFmtQ8 && K % 128 == 0;
+  bool wide = can_wide && (forced == 0 ? true : forced >= 10000);
+  switch (forced % 10000) {
+#define BOLT_CFG(MT_, KW_, UNR_)                                                                                    \
+  case MT_ * 1000 + KW_ * 10 + UNR_:                                                                              \
+    if (wide) LaunchMmaGemvImpl<FMT, FMT != kFmtQ8, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);                  \
+    else LaunchMmaGemvImpl<FMT, false, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);                               \
+    return;
+    BOLT_CFG(1, 4, 1) BOLT_CFG(1, 8, 1) BOLT_CFG(1, 16, 1) BOLT_CFG(1, 8, 2) BOLT_CFG(2, 4, 1) BOLT_CFG(2, 8, 1) BOLT_CFG(2, 4, 2)
+#undef BOLT_CFG
+    default: break;
+  }
+  if (N >= 8192) {
+    if (wide) LaunchMmaGemvImpl<FMT, FMT != kFmtQ8, 2, 4>(x, w, sc, gs, R, N, K, y, s);
+    else LaunchMmaGemvImpl<FMT, false, 2, 4>(x, w, sc, gs, R, N, K, y, s);
+  } else {
+    if (wide) LaunchMmaGemvImpl<FMT, FMT != kFmtQ8, 1, 16>(x, w, sc, gs, R, N, K, y, s);
+    else LaunchMmaGemvImpl<FMT, false, 1, 16>(x, w, sc, gs, R, N, K, y, s);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -824,17 +897,18 @@ __global__ void MoeGroupKernel(const int* __restrict__ idx, int P, int topk, int
 }
 
 // PH 1: h[pair, j] = relu2(bf16(sum_k z[row, k] * W1[e, j, k])); PH 2: part[pair, n] = bf16(sum_k h[pair, k] * W2[e, n, k]).
-template <int PH, int MT, int KW>
+template <int PH, bool WIDE, int MT, int KW>
 __global__ void __launch_bounds__(KW * 32)
     MoeMmaKernel(const bf16* __restrict__ xin, const int* __restrict__ meta, int P, int R, int Nrows, int K,
                  const uint8_t* __restrict__ w, const bf16* __restrict__ sc, void* __restrict__ out) {
+  constexpr int NH = WIDE ? 2 : 1;
   const int u = blockIdx.y;
   if (u >= meta[0]) return;
   const int64_t e = meta[1 + u];
   const int* pair_of = meta + 1 + P + u * 8;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
-  const int nchunks = K / 64;
+  const int nchunks = K / (64 * NH);
   const int n_base = blockIdx.x * (MT * 16);
   const int xpair = pair_of[g];
   const bf16* xr = xin;
@@ -846,72 +920,26 @@ __global__ void __launch_bounds__(KW * 32)
     xvalid = xpair >= 0;
     xr += static_cast<int64_t>(max(xpair, 0)) * K;
   }
-
-  struct Stage {
-    uint4 raw[MT][2];
-    float sc[MT][2];
-    uint4 xa, xb;
-  };
   float acc[MT][4];
 #pragma unroll
   for (int m = 0; m < MT; ++m)
 #pragma unroll
     for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
-  auto load = [&](int c, Stage& st) {
+  MmaMainLoop<kFmtQ4, WIDE, MT, KW, 1>(warp, nchunks, acc, [&](int c, StageT<kFmtQ4, WIDE, MT>& st) {
 #pragma unroll
     for (int m = 0; m < MT; ++m)
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int64_t row = e * Nrows + min(n_base + m * 16 + g + 8 * h, Nrows - 1);
-        LoadWeightRow<kFmtQ4>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+        LoadWeightRow<kFmtQ4, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
       }
-    const uint4* xp = reinterpret_cast<const uint4*>(xr + 64 * c + 16 * t);
-    st.xa = xvalid ? __ldg(xp) : make_uint4(0, 0, 0, 0);
-    st.xb = xvalid ? __ldg(xp + 1) : make_uint4(0, 0, 0, 0);
-  };
-  Stage cur, nxt;
-  int c = warp;
-  if (c < nchunks) load(c, cur);
-  for (; c < nchunks; c += KW) {
-    if (c + KW < nchunks) load(c + KW, nxt);
-    uint32_t bl[4], bh[4];
-    bl[0] = __byte_perm(cur.xa.x, cur.xa.z, 0x5410);
-    bl[1] = __byte_perm(cur.xa.x, cur.xa.z, 0x7632);
-    bl[2] = __byte_perm(cur.xa.y, cur.xa.w, 0x5410);
-    bl[3] = __byte_perm(cur.xa.y, cur.xa.w, 0x7632);
-    bh[0] = __byte_perm(cur.xb.x, cur.xb.z, 0x5410);
-    bh[1] = __byte_perm(cur.xb.x, cur.xb.z, 0x7632);
-    bh[2] = __byte_perm(cur.xb.y, cur.xb.w, 0x5410);
-    bh[3] = __byte_perm(cur.xb.y, cur.xb.w, 0x7632);
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-      uint32_t lo0[4], hi0[4], lo1[4], hi1[4];
-      DequantRow<kFmtQ4>(cur.raw[m][0], cur.sc[m][0], lo0, hi0);
-      DequantRow<kFmtQ4>(cur.raw[m][1], cur.sc[m][1], lo1, hi1);
-#pragma unroll
-      for (int s = 0; s < 4; ++s) Mma16816(acc[m], lo0[s], lo1[s], hi0[s], hi1[s], bl[s], bh[s]);
-    }
-    cur = nxt;
-  }
-  extern __shared__ float red[];
-#pragma unroll
-  for (int m = 0; m < MT; ++m) {
-    float* r0 = red + (warp * MT * 16 + m * 16 + g) * 8 + 2 * t;
-    r0[0] = acc[m][0];
-    r0[1] = acc[m][1];
-    r0[8 * 8] = acc[m][2];
-    r0[8 * 8 + 1] = acc[m][3];
-  }
-  __syncthreads();
-  for (int i = threadIdx.x; i < MT * 16 * 8; i += KW * 32) {
-    const int rl = i >> 3, col = i & 7;
+    LoadX<NH>(xr, xvalid, c, t, st.x);
+  });
+  ReduceEpilogue<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
     const int j = n_base + rl;
-    if (j >= Nrows) continue;
+    if (j >= Nrows) return;
     const int pair = pair_of[col];
-    if (pair < 0) continue;
-    float v = 0.f;
-#pragma unroll
-    for (int k = 0; k < KW; ++k) v += red[(k * MT * 16 + rl) * 8 + col];
+    if (pair < 0) return;
     v = B2F(__float2bfloat16(v));
     if constexpr (PH == 1) {
       const float r = fmaxf(v, 0.f);
@@ -919,7 +947,7 @@ __global__ void __launch_bounds__(KW * 32)
     } else {
       reinterpret_cast<float*>(out)[static_cast<int64_t>(pair) * Nrows + j] = v;
     }
-  }
+  });
 }
 
 struct MoeVerifyState {
@@ -946,11 +974,18 @@ struct MoeVerifyState {
       cudaStream_t s = Stream(api, raw);
       int* mp = Out<int>(meta);
       MoeGroupKernel<<<1, 128, 0, s>>>(In<int>(c, 1), P, topk, mp);
+      static const int cfg = getenv("BOLT_MOE_CFG") ? atoi(getenv("BOLT_MOE_CFG")) : 0;  // 1: narrow chunks
+      const bool wide2 = cfg == 0 && I % 128 == 0;
       constexpr int MT1 = 2, KW1 = 4, MT2 = 2, KW2 = 8;
-      MoeMmaKernel<1, MT1, KW1><<<dim3(I / (16 * MT1), P), KW1 * 32, KW1 * MT1 * 16 * 8 * sizeof(float), s>>>(
+      MoeMmaKernel<1, true, MT1, KW1><<<dim3(I / (16 * MT1), P), KW1 * 32, KW1 * MT1 * 16 * 8 * sizeof(float), s>>>(
           In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
-      MoeMmaKernel<2, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
-          Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+      if (wide2) {
+        MoeMmaKernel<2, true, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
+            Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+      } else {
+        MoeMmaKernel<2, false, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
+            Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+      }
       MoeFinalizeKernel<<<R, 256, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
       CheckLaunch();
       return nullptr;
