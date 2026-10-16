@@ -43,3 +43,11 @@ is exact), the fp32 accumulation replaces the old fp16 partial sums. R = 1 keeps
 draft tokens need no rollback copy.
 
 Benchmarks: `tools/bench_gemv.py`, `tools/bench_moe.py` (eager, so kernels below ~10 us are launch-bound there; use nsys for those).
+
+## Exact IQ2_XXS (`iq2=1`)
+
+`Q4Gemv` and `MoeVerify` take an optional integer attribute `iq2`. With `iq2=1` the 4-bit weights are **LUT codes of the exact ggml IQ2_XXS values** instead of symmetric int4:
+code = magnitude index (0, 1, 2 <-> 8, 25, 43) + 4 * (negative), packed low nibble first, bf16 block-32 scale `db` (see `iq2xxs_to_lut4` in the exporter's `bolt_weights.py`).
+The int4 re-quantisation used before maps {8, 25, 43} to {8.5, 25.5, 42.6} (up to 6 % error on the smallest magnitude, measurably worse NLL: +0.012 nats/token on 2k-token texts).
+The kernel decodes 4 weights per `prmt` pair (high- and low-byte LUT planes of the bf16 values), multiplies by the scale and feeds adjacent k pairs to `mma.m16n8k16`
+(the x fragments need no repacking). Same memory and bandwidth as int4. Requires 2..8 rows (the verify path); R = 1 is not implemented for `iq2=1`.

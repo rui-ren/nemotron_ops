@@ -635,7 +635,10 @@ void LaunchNvfp4(const bf16* x, const uint8_t* w, const uint8_t* ws, const float
 // 16 consecutive k of weight rows g and g+8 at k = 64c + 16t (one 16-byte load for int8, 8 bytes for int4 / fp4), so the
 // weights need no repacking. mma sums over k, so any k permutation shared by A and B is valid: MMA step s uses
 // k-slots (s, s+4) and (8+s, 12+s) of the thread's 16 values (adjacent nibbles/bytes need no shuffling, only x is paired up).
-enum { kFmtQ8 = 0, kFmtQ4 = 1, kFmtFp4 = 2 };
+// kFmtIq2: exact IQ2_XXS (ggml) weights as 4-bit LUT codes: code = mag_idx + 4 * (negative), value = +-{8, 25, 43} * block scale.
+// Same packing and scale layout as kFmtQ4, but the 16 values of a thread are consumed as 4 adjacent groups of 4 (one prmt LUT
+// lookup per 4 weights) instead of the (s, s+4) k-slot pairing.
+enum { kFmtQ8 = 0, kFmtQ4 = 1, kFmtFp4 = 2, kFmtIq2 = 3 };
 
 __device__ __forceinline__ void Mma16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
@@ -668,11 +671,11 @@ __device__ __forceinline__ void LoadWeightRow(const uint8_t* w, const void* sc, 
   } else if constexpr (!WIDE) {
     const uint2 v = __ldg(reinterpret_cast<const uint2*>(w + row * (K / 2) + 32 * c + 8 * t));
     raw = make_uint4(v.x, v.y, 0u, 0u);
-    if constexpr (FMT == kFmtQ4) scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
+    if constexpr (FMT == kFmtQ4 || FMT == kFmtIq2) scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
     else scale[0] = Fp8E4M3ToFloat(reinterpret_cast<const uint8_t*>(sc)[row * (K / 16) + 4 * c + t]);
   } else {
     raw = __ldg(reinterpret_cast<const uint4*>(w + row * (K / 2) + 64 * c + 16 * t));
-    if constexpr (FMT == kFmtQ4) {
+    if constexpr (FMT == kFmtQ4 || FMT == kFmtIq2) {
       scale[0] = scale[1] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 4 * c + t]);
     } else {
       const uint16_t two = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(sc) + row * (K / 16) + 8 * c + 2 * t);
@@ -698,6 +701,19 @@ __device__ __forceinline__ void DequantRow(const uint4& raw, float scale, uint32
     for (int s = 0; s < 4; ++s) {
       lo[s] = PackBf16((ByteToMagic(raw.x, s) - 8388736.0f) * scale, (ByteToMagic(raw.y, s) - 8388736.0f) * scale);
       hi[s] = PackBf16((ByteToMagic(raw.z, s) - 8388736.0f) * scale, (ByteToMagic(raw.w, s) - 8388736.0f) * scale);
+    }
+  } else if constexpr (FMT == kFmtIq2) {
+    // LUT bytes indexed by code 0..7: bf16 of +8, +25, +43, -, -8, -25, -43, - (high / low byte planes)
+    constexpr uint32_t kHiA = 0x00424141u, kHiB = 0x00C2C1C1u, kLoA = 0x002CC800u, kLoB = 0x002CC800u;
+    const __nv_bfloat162 sc2 = __bfloat162bfloat162(__float2bfloat16(scale));
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const uint32_t w = (s < 2) ? raw.x : raw.y;
+      const uint32_t sel = (s & 1) ? (w >> 16) : (w & 0xFFFFu);
+      const uint32_t H = __byte_perm(kHiA, kHiB, sel);
+      const uint32_t L = __byte_perm(kLoA, kLoB, sel);
+      lo[s] = AsU32(__hmul2(AsBf162(__byte_perm(L, H, 0x5140)), sc2));
+      hi[s] = AsU32(__hmul2(AsBf162(__byte_perm(L, H, 0x7362)), sc2));
     }
   } else if constexpr (FMT == kFmtQ4) {
     const __nv_bfloat162 sc2 = __bfloat162bfloat162(__float2bfloat16(scale));
@@ -739,14 +755,19 @@ __device__ __forceinline__ void ComputeStage(const StageT<FMT, WIDE, MT>& st, fl
   for (int h = 0; h < StageT<FMT, WIDE, MT>::NH; ++h) {
     const uint4 xa = st.x[2 * h], xb = st.x[2 * h + 1];
     uint32_t bl[4], bh[4];
-    bl[0] = __byte_perm(xa.x, xa.z, 0x5410);
-    bl[1] = __byte_perm(xa.x, xa.z, 0x7632);
-    bl[2] = __byte_perm(xa.y, xa.w, 0x5410);
-    bl[3] = __byte_perm(xa.y, xa.w, 0x7632);
-    bh[0] = __byte_perm(xb.x, xb.z, 0x5410);
-    bh[1] = __byte_perm(xb.x, xb.z, 0x7632);
-    bh[2] = __byte_perm(xb.y, xb.w, 0x5410);
-    bh[3] = __byte_perm(xb.y, xb.w, 0x7632);
+    if constexpr (FMT == kFmtIq2) {  // adjacent k pairs: MMA s consumes x[4s .. 4s+3]
+      bl[0] = xa.x; bh[0] = xa.y; bl[1] = xa.z; bh[1] = xa.w;
+      bl[2] = xb.x; bh[2] = xb.y; bl[3] = xb.z; bh[3] = xb.w;
+    } else {
+      bl[0] = __byte_perm(xa.x, xa.z, 0x5410);
+      bl[1] = __byte_perm(xa.x, xa.z, 0x7632);
+      bl[2] = __byte_perm(xa.y, xa.w, 0x5410);
+      bl[3] = __byte_perm(xa.y, xa.w, 0x7632);
+      bh[0] = __byte_perm(xb.x, xb.z, 0x5410);
+      bh[1] = __byte_perm(xb.x, xb.z, 0x7632);
+      bh[2] = __byte_perm(xb.y, xb.w, 0x5410);
+      bh[3] = __byte_perm(xb.y, xb.w, 0x7632);
+    }
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
       uint32_t lo0[4], hi0[4], lo1[4], hi1[4];
@@ -906,7 +927,7 @@ __global__ void MoeGroupKernel(const int* __restrict__ idx, int P, int topk, int
 }
 
 // PH 1: h[pair, j] = relu2(bf16(sum_k z[row, k] * W1[e, j, k])); PH 2: part[pair, n] = bf16(sum_k h[pair, k] * W2[e, n, k]).
-template <int PH, bool WIDE, int MT, int KW>
+template <int FMT, int PH, bool WIDE, int MT, int KW>
 __global__ void __launch_bounds__(KW * 32)
     MoeMmaKernel(const bf16* __restrict__ xin, const int* __restrict__ meta, int P, int R, int Nrows, int K,
                  const uint8_t* __restrict__ w, const bf16* __restrict__ sc, void* __restrict__ out) {
@@ -934,13 +955,13 @@ __global__ void __launch_bounds__(KW * 32)
   for (int m = 0; m < MT; ++m)
 #pragma unroll
     for (int i = 0; i < 4; ++i) acc[m][i] = 0.f;
-  MmaMainLoop<kFmtQ4, WIDE, MT, KW, 1>(warp, nchunks, acc, [&](int c, StageT<kFmtQ4, WIDE, MT>& st) {
+  MmaMainLoop<FMT, WIDE, MT, KW, 1>(warp, nchunks, acc, [&](int c, StageT<FMT, WIDE, MT>& st) {
 #pragma unroll
     for (int m = 0; m < MT; ++m)
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int64_t row = e * Nrows + min(n_base + m * 16 + g + 8 * h, Nrows - 1);
-        LoadWeightRow<kFmtQ4, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
+        LoadWeightRow<FMT, WIDE>(w, sc, row, K, c, t, st.raw[m][h], st.sc[m][h]);
       }
     LoadX<NH>(xr, xvalid, c, t, st.x);
   });
@@ -959,12 +980,23 @@ __global__ void __launch_bounds__(KW * 32)
   });
 }
 
+// Optional integer attribute (custom-op attributes are not declared, so absence has to be probed).
+int OptAttr(const OrtKernelInfo* info, const char* name, int def) {
+  try {
+    return static_cast<int>(Ort::ConstKernelInfo(info).GetAttribute<int64_t>(name));
+  } catch (...) {
+    return def;
+  }
+}
+
 struct MoeVerifyState {
   const OrtApi& api;
   int topk;
+  int iq2;  // 1: expert weights are the exact IQ2_XXS LUT codes (kFmtIq2) instead of symmetric int4
   MoeVerifyState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
     Ort::ConstKernelInfo k(info);
     topk = static_cast<int>(k.GetAttribute<int64_t>("topk"));
+    iq2 = OptAttr(info, "iq2", 0);
   }
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
@@ -986,15 +1018,20 @@ struct MoeVerifyState {
       static const int cfg = getenv("BOLT_MOE_CFG") ? atoi(getenv("BOLT_MOE_CFG")) : 0;  // 1: narrow chunks
       const bool wide2 = cfg == 0 && I % 128 == 0;
       constexpr int MT1 = 2, KW1 = 4, MT2 = 2, KW2 = 8;
-      MoeMmaKernel<1, true, MT1, KW1><<<dim3(I / (16 * MT1), P), KW1 * 32, KW1 * MT1 * 16 * 8 * sizeof(float), s>>>(
-          In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
-      if (wide2) {
-        MoeMmaKernel<2, true, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
-            Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
-      } else {
-        MoeMmaKernel<2, false, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
-            Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
-      }
+      auto launch = [&](auto fmt) {
+        constexpr int FMT = decltype(fmt)::value;
+        MoeMmaKernel<FMT, 1, true, MT1, KW1><<<dim3(I / (16 * MT1), P), KW1 * 32, KW1 * MT1 * 16 * 8 * sizeof(float), s>>>(
+            In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
+        if (wide2) {
+          MoeMmaKernel<FMT, 2, true, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
+              Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+        } else {
+          MoeMmaKernel<FMT, 2, false, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
+              Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+        }
+      };
+      if (iq2) launch(std::integral_constant<int, kFmtIq2>{});
+      else launch(std::integral_constant<int, kFmtQ4>{});
       MoeFinalizeKernel<<<R, 256, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
       CheckLaunch();
       return nullptr;
@@ -1177,7 +1214,8 @@ void LaunchQGemv(int R, const bf16* x, const uint8_t* w, const bf16* sc, int N, 
 template <int BITS>
 struct QGemvState {
   const OrtApi& api;
-  QGemvState(const OrtApi& a, const OrtKernelInfo*) : api(a) {}
+  int iq2;  // Q4Gemv only: exact IQ2_XXS LUT codes (needs 2..8 rows)
+  QGemvState(const OrtApi& a, const OrtKernelInfo* info) : api(a), iq2(BITS == 4 ? OptAttr(info, "iq2", 0) : 0) {}
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
       Ort::KernelContext c(raw);
@@ -1190,7 +1228,10 @@ struct QGemvState {
       if (K % 32 != 0 || Dim(w, 1) * 32 != K) throw std::invalid_argument("QGemv: K mismatch");
       shape.back() = N;
       auto y = c.GetOutput(0, shape);
-      if (R >= 2 && R <= 8 && K % 64 == 0) {
+      if (iq2 && !(R >= 2 && R <= 8 && K % 128 == 0)) throw std::invalid_argument("Q4Gemv iq2: needs 2..8 rows and K % 128 == 0");
+      if (iq2) {
+        LaunchMmaGemv<kFmtIq2>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
+      } else if (R >= 2 && R <= 8 && K % 64 == 0) {
         LaunchMmaGemv<BITS == 8 ? kFmtQ8 : kFmtQ4>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K,
                                                    Out<bf16>(y), Stream(api, raw));
       } else {

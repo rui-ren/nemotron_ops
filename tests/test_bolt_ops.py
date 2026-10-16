@@ -151,6 +151,60 @@ def test_moe_decode(R, E, I, topk=9, op="MoeDecode"):
     assert rel(out, ref) < 1e-2
 
 
+IQ2_VALUES = torch.tensor([8, 25, 43, 0, -8, -25, -43, 0], dtype=torch.float32)
+
+
+def iq2_codes(*shape):
+    mag = torch.randint(0, 3, shape)
+    sign = torch.randint(0, 2, shape)
+    return (mag + 4 * sign).to(torch.uint8)
+
+
+def pack_nibbles(code):
+    return (code[..., 0::2] | (code[..., 1::2] << 4)).contiguous()
+
+
+def test_q4_iq2(R, N, K):
+    torch.manual_seed(11)
+    nb = K // 32
+    code = iq2_codes(N, K)
+    q = pack_nibbles(code).reshape(N, nb, 16)
+    sc = (torch.rand(N, nb) * 0.02).bfloat16()
+    x = torch.randn(R, K).bfloat16()
+    deq = IQ2_VALUES[code.long()].reshape(N, nb, 32) * sc.float().unsqueeze(-1)
+    ref = x.float() @ deq.reshape(N, K).T
+    (y,) = run("Q4Gemv", [("x", x.to(DEV)), ("w", q.to(DEV)), ("s", sc.to(DEV))], [BF], {"iq2": 1})
+    print(f"Q4Gemv iq2 R={R} N={N} K={K}: rel err {rel(y, ref):.2e}")
+    assert rel(y, ref) < 6e-3
+
+
+def test_moe_iq2(R, E, I, topk=9):
+    torch.manual_seed(12)
+    z = (torch.randn(R, 1024) * 0.5).bfloat16()
+    idx = torch.stack([torch.randperm(E)[:topk] for _ in range(R)]).int()
+    w = torch.rand(R, topk)
+    c1, c2 = iq2_codes(E, I, 1024), iq2_codes(E, 1024, I)
+    w1, w2 = pack_nibbles(c1), pack_nibbles(c2)
+    s1 = (torch.rand(E, I, 32) * 0.003).bfloat16()
+    s2 = (torch.rand(E, 1024, I // 32) * 0.003).bfloat16()
+
+    def deq(c, s, n, k):
+        return (IQ2_VALUES[c.long()].reshape(c.shape[0], n, k // 32, 32) * s.float().unsqueeze(-1)).reshape(c.shape[0], n, k)
+
+    d1, d2 = deq(c1, s1, I, 1024), deq(c2, s2, 1024, I)
+    ref = torch.zeros(R, 1024)
+    for t in range(R):
+        for j in range(topk):
+            e = idx[t, j]
+            h = (z[t].float() @ d1[e].T).bfloat16().float()
+            h = (torch.relu(h) ** 2).bfloat16().float()
+            ref[t] += w[t, j] * (h @ d2[e].T).bfloat16().float()
+    out = run("MoeVerify", [("z", z.to(DEV)), ("i", idx.to(DEV)), ("w", w.to(DEV)), ("w1", w1.to(DEV)), ("s1", s1.to(DEV)),
+                            ("w2", w2.to(DEV)), ("s2", s2.to(DEV))], [BF, BF, F32, I32], {"topk": topk, "iq2": 1})[0]
+    print(f"MoeVerify iq2 R={R} E={E} I={I}: rel err {rel(out, ref):.2e}")
+    assert rel(out, ref) < 1e-2
+
+
 def test_mamba(R, heads=128, hd=64, ds=128, ng=8):
     torch.manual_seed(5)
     di = heads * hd
@@ -249,6 +303,10 @@ if __name__ == "__main__":
         test_moe_decode(R, E, I, topk=9 if E > 12 else 6, op="MoeVerify")
     for R in (1, 2, 8, 16):
         test_mamba(R)
+    for R, N, K in ((8, 5376, 4096), (2, 4096, 5376), (5, 1024, 4096), (8, 131072 // 8, 4096)):
+        test_q4_iq2(R, N, K)
+    for R, E, I in ((8, 304, 2304), (3, 240, 2048), (8, 12, 2560)):
+        test_moe_iq2(R, E, I, topk=9 if E > 12 else 6)
     test_mamba_verify(8, 3)
     test_mamba_verify(5, 0)
     print("all passed")
