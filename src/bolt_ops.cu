@@ -24,6 +24,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "iq2xxs_grid.h"
+
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -638,7 +640,12 @@ void LaunchNvfp4(const bf16* x, const uint8_t* w, const uint8_t* ws, const float
 // kFmtIq2: exact IQ2_XXS (ggml) weights as 4-bit LUT codes: code = mag_idx + 4 * (negative), value = +-{8, 25, 43} * block scale.
 // Same packing and scale layout as kFmtQ4, but the 16 values of a thread are consumed as 4 adjacent groups of 4 (one prmt LUT
 // lookup per 4 weights) instead of the (s, s+4) k-slot pairing.
-enum { kFmtQ8 = 0, kFmtQ4 = 1, kFmtFp4 = 2, kFmtIq2 = 3 };
+//
+// kFmtIq2N: the ggml IQ2_XXS data, repacked 8-byte aligned: B = [N, K/32, 8] bytes (per 32 k: 4 grid-index bytes and one u32 with
+// four 7-bit sign indices + a 4-bit scale, exactly the ggml records) and D = [N, K/256] fp16 super-block scales (the raw fp16 bits,
+// carried in the op's bf16-typed scale input). 2.06 bits per weight. A thread's 16 k are two grid vectors; the decoded weights
+// are bit-identical to the kFmtIq2 path (bf16(d * (0.5 + s) * 0.25) as the block scale).
+enum { kFmtQ8 = 0, kFmtQ4 = 1, kFmtFp4 = 2, kFmtIq2 = 3, kFmtIq2N = 4 };
 
 __device__ __forceinline__ void Mma16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
@@ -660,12 +667,42 @@ __device__ __forceinline__ float ByteToMagic(uint32_t w, int s) {
   return __uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | s));
 }
 
+// IQ2_XXS decode tables in shared memory: 256 x 8 bf16 magnitudes and 256 x 8 bf16 sign masks (index = 8-bit sign pattern).
+struct Iq2Tables {
+  uint4 grid[256];
+  uint4 sign[256];
+};
+__device__ __forceinline__ Iq2Tables& Iq2Smem() {
+  __shared__ Iq2Tables tables;
+  return tables;
+}
+__device__ __forceinline__ void Iq2TablesInit() {
+  Iq2Tables& t = Iq2Smem();
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+    t.grid[i] = make_uint4(kIq2xxsGridBf16[i][0], kIq2xxsGridBf16[i][1], kIq2xxsGridBf16[i][2], kIq2xxsGridBf16[i][3]);
+    // bf16 sign-bit masks of the 8 elements selected by the 8-bit sign pattern i
+    t.sign[i] = make_uint4(((i & 1u) << 15) | (((i >> 1) & 1u) << 31), (((i >> 2) & 1u) << 15) | (((i >> 3) & 1u) << 31),
+                           (((i >> 4) & 1u) << 15) | (((i >> 5) & 1u) << 31), (((i >> 6) & 1u) << 15) | (((i >> 7) & 1u) << 31));
+  }
+  __syncthreads();
+}
+
 // WIDE (int4 / fp4 only): a thread loads 16 bytes = 32 k of a row per chunk (chunk = 128 k, 64 contiguous bytes per row for
 // the 4 threads t) instead of 8 bytes; the two 16-k halves are consumed as two MMA groups.
 template <int FMT, bool WIDE>
 __device__ __forceinline__ void LoadWeightRow(const uint8_t* w, const void* sc, int64_t row, int K, int c, int t, uint4& raw,
                                               float* scale) {
-  if constexpr (FMT == kFmtQ8) {
+  if constexpr (FMT == kFmtIq2N) {
+    // chunk c = 64 k = two 32-k groups of 8-byte records; thread t owns half (t & 1) of group 2c + (t >> 1)
+    const uint2 rec = __ldg(reinterpret_cast<const uint2*>(w + (row * (K / 32) + 2 * c + (t >> 1)) * 8));
+    const int h = t & 1;
+    const float d = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const uint16_t*>(sc) + row * (K / 256) + (c >> 2))));
+    const uint32_t sg = rec.y;
+    const uint32_t s0 = (sg >> (14 * h)) & 127u, s1 = (sg >> (14 * h + 7)) & 127u;
+    const uint32_t sa = s0 | ((__popc(s0) & 1) << 7), sb = s1 | ((__popc(s1) & 1) << 7);
+    raw = make_uint4((rec.x >> (16 * h)) & 0xFFu, (rec.x >> (16 * h + 8)) & 0xFFu, sa, sb);
+    scale[0] = d * (0.5f + static_cast<float>(sg >> 28)) * 0.25f;
+  } else if constexpr (FMT == kFmtQ8) {
     raw = __ldg(reinterpret_cast<const uint4*>(w + row * K + 64 * c + 16 * t));
     scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
   } else if constexpr (!WIDE) {
@@ -696,7 +733,22 @@ struct StageT {
 // Dequantised bf16x2 pairs for MMA step s: lo[s] = k-slots (s, s+4), hi[s] = (8+s, 12+s).
 template <int FMT>
 __device__ __forceinline__ void DequantRow(const uint4& raw, float scale, uint32_t* lo, uint32_t* hi) {
-  if constexpr (FMT == kFmtQ8) {
+  if constexpr (FMT == kFmtIq2N) {
+    const __nv_bfloat162 sc2 = __bfloat162bfloat162(__float2bfloat16(scale));
+    const uint4 ga = __ldg(reinterpret_cast<const uint4*>(kIq2xxsGridBf16[raw.x])), gb = __ldg(reinterpret_cast<const uint4*>(kIq2xxsGridBf16[raw.y]));
+    const uint32_t sa = raw.z, sb = raw.w;
+    // bf16 sign-bit masks: element j of the 8 takes bit j of the sign pattern
+    // (x * (2^(15-2k) + 2^(30-2k))) puts bit 2k of x at bit 15 and bit 2k+1 at bit 31 without a carry between the two products
+    auto mask = [](uint32_t sgn, int pair) { return (sgn * ((1u << (15 - 2 * pair)) + (1u << (30 - 2 * pair)))) & 0x80008000u; };
+    lo[0] = AsU32(__hmul2(AsBf162(ga.x ^ mask(sa, 0)), sc2));
+    hi[0] = AsU32(__hmul2(AsBf162(ga.y ^ mask(sa, 1)), sc2));
+    lo[1] = AsU32(__hmul2(AsBf162(ga.z ^ mask(sa, 2)), sc2));
+    hi[1] = AsU32(__hmul2(AsBf162(ga.w ^ mask(sa, 3)), sc2));
+    lo[2] = AsU32(__hmul2(AsBf162(gb.x ^ mask(sb, 0)), sc2));
+    hi[2] = AsU32(__hmul2(AsBf162(gb.y ^ mask(sb, 1)), sc2));
+    lo[3] = AsU32(__hmul2(AsBf162(gb.z ^ mask(sb, 2)), sc2));
+    hi[3] = AsU32(__hmul2(AsBf162(gb.w ^ mask(sb, 3)), sc2));
+  } else if constexpr (FMT == kFmtQ8) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       lo[s] = PackBf16((ByteToMagic(raw.x, s) - 8388736.0f) * scale, (ByteToMagic(raw.y, s) - 8388736.0f) * scale);
@@ -755,7 +807,7 @@ __device__ __forceinline__ void ComputeStage(const StageT<FMT, WIDE, MT>& st, fl
   for (int h = 0; h < StageT<FMT, WIDE, MT>::NH; ++h) {
     const uint4 xa = st.x[2 * h], xb = st.x[2 * h + 1];
     uint32_t bl[4], bh[4];
-    if constexpr (FMT == kFmtIq2) {  // adjacent k pairs: MMA s consumes x[4s .. 4s+3]
+    if constexpr (FMT == kFmtIq2 || FMT == kFmtIq2N) {  // adjacent k pairs: MMA s consumes x[4s .. 4s+3]
       bl[0] = xa.x; bh[0] = xa.y; bl[1] = xa.z; bh[1] = xa.w;
       bl[2] = xb.x; bh[2] = xb.y; bl[3] = xb.z; bh[3] = xb.w;
     } else {
@@ -870,15 +922,18 @@ void LaunchMmaGemvImpl(const bf16* x, const uint8_t* w, const void* sc, const fl
 }
 
 template <int FMT>
+constexpr bool kCanWide = FMT != kFmtQ8 && FMT != kFmtIq2N;
+
+template <int FMT>
 void LaunchMmaGemv(const bf16* x, const uint8_t* w, const void* sc, const float* gs, int R, int N, int K, bf16* y,
                    cudaStream_t s) {
   static const int forced = getenv("BOLT_GEMV_CFG") ? atoi(getenv("BOLT_GEMV_CFG")) : 0;  // wide*10000 + MT*1000 + KW*10 + UNR
-  const bool can_wide = FMT != kFmtQ8 && K % 128 == 0;
+  const bool can_wide = kCanWide<FMT> && K % 128 == 0;
   bool wide = can_wide && (forced == 0 ? true : forced >= 10000);
   switch (forced % 10000) {
 #define BOLT_CFG(MT_, KW_, UNR_)                                                                                    \
   case MT_ * 1000 + KW_ * 10 + UNR_:                                                                              \
-    if (wide) LaunchMmaGemvImpl<FMT, FMT != kFmtQ8, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);                  \
+    if (wide) LaunchMmaGemvImpl<FMT, kCanWide<FMT>, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);                  \
     else LaunchMmaGemvImpl<FMT, false, MT_, KW_, UNR_>(x, w, sc, gs, R, N, K, y, s);                               \
     return;
     BOLT_CFG(1, 4, 1) BOLT_CFG(1, 8, 1) BOLT_CFG(1, 16, 1) BOLT_CFG(1, 8, 2) BOLT_CFG(2, 4, 1) BOLT_CFG(2, 8, 1) BOLT_CFG(2, 4, 2)
@@ -886,10 +941,10 @@ void LaunchMmaGemv(const bf16* x, const uint8_t* w, const void* sc, const float*
     default: break;
   }
   if (N >= 8192) {
-    if (wide) LaunchMmaGemvImpl<FMT, FMT != kFmtQ8, 2, 4>(x, w, sc, gs, R, N, K, y, s);
+    if (wide) LaunchMmaGemvImpl<FMT, kCanWide<FMT>, 2, 4>(x, w, sc, gs, R, N, K, y, s);
     else LaunchMmaGemvImpl<FMT, false, 2, 4>(x, w, sc, gs, R, N, K, y, s);
   } else {
-    if (wide) LaunchMmaGemvImpl<FMT, FMT != kFmtQ8, 1, 16>(x, w, sc, gs, R, N, K, y, s);
+    if (wide) LaunchMmaGemvImpl<FMT, kCanWide<FMT>, 1, 16>(x, w, sc, gs, R, N, K, y, s);
     else LaunchMmaGemvImpl<FMT, false, 1, 16>(x, w, sc, gs, R, N, K, y, s);
   }
 }
@@ -992,7 +1047,7 @@ int OptAttr(const OrtKernelInfo* info, const char* name, int def) {
 struct MoeVerifyState {
   const OrtApi& api;
   int topk;
-  int iq2;  // 1: expert weights are the exact IQ2_XXS LUT codes (kFmtIq2) instead of symmetric int4
+  int iq2;  // 1: exact IQ2_XXS as 4-bit LUT codes (kFmtIq2); 2: the native ggml IQ2_XXS blocks (kFmtIq2N); 0: symmetric int4
   MoeVerifyState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
     Ort::ConstKernelInfo k(info);
     topk = static_cast<int>(k.GetAttribute<int64_t>("topk"));
@@ -1016,21 +1071,50 @@ struct MoeVerifyState {
       int* mp = Out<int>(meta);
       MoeGroupKernel<<<1, 128, 0, s>>>(In<int>(c, 1), P, topk, mp);
       static const int cfg = getenv("BOLT_MOE_CFG") ? atoi(getenv("BOLT_MOE_CFG")) : 0;  // 1: narrow chunks
-      const bool wide2 = cfg == 0 && I % 128 == 0;
-      constexpr int MT1 = 2, KW1 = 4, MT2 = 2, KW2 = 8;
+      const bool wide2 = cfg == 0 && I % 128 == 0 && iq2 != 2;
+      using C1 = std::integral_constant<int, 1>;
+      using C2 = std::integral_constant<int, 2>;
+      using C4 = std::integral_constant<int, 4>;
+      using C8 = std::integral_constant<int, 8>;
+      using C16 = std::integral_constant<int, 16>;
       auto launch = [&](auto fmt) {
         constexpr int FMT = decltype(fmt)::value;
-        MoeMmaKernel<FMT, 1, true, MT1, KW1><<<dim3(I / (16 * MT1), P), KW1 * 32, KW1 * MT1 * 16 * 8 * sizeof(float), s>>>(
-            In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
-        if (wide2) {
-          MoeMmaKernel<FMT, 2, true, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
-              Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
-        } else {
-          MoeMmaKernel<FMT, 2, false, MT2, KW2><<<dim3(1024 / (16 * MT2), P), KW2 * 32, KW2 * MT2 * 16 * 8 * sizeof(float), s>>>(
-              Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+        auto fc1 = [&](auto mt, auto kw) {
+          constexpr int MT = decltype(mt)::value, KW = decltype(kw)::value;
+          MoeMmaKernel<FMT, 1, kCanWide<FMT>, MT, KW><<<dim3(I / (16 * MT), P), KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(
+              In<bf16>(c, 0), mp, P, R, I, 1024, In<uint8_t>(c, 3), In<bf16>(c, 4), Out<bf16>(h));
+        };
+        auto fc2 = [&](auto mt, auto kw) {
+          constexpr int MT = decltype(mt)::value, KW = decltype(kw)::value;
+          constexpr bool WD = kCanWide<FMT>;
+          if (WD && wide2) {
+            MoeMmaKernel<FMT, 2, WD, MT, KW><<<dim3(1024 / (16 * MT), P), KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(
+                Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+          } else {
+            MoeMmaKernel<FMT, 2, false, MT, KW><<<dim3(1024 / (16 * MT), P), KW * 32, KW * MT * 16 * 8 * sizeof(float), s>>>(
+                Out<bf16>(h), mp, P, R, 1024, I, In<uint8_t>(c, 5), In<bf16>(c, 6), Out<float>(part));
+          }
+        };
+        // tuning knob (BOLT_MOE_CFG = 10 * fc1 + fc2 choice); the default is (2 MMA tiles, 4 warps) for fc1 and (2, 8) for fc2
+        const int sel = (cfg == 0 || cfg == 1) ? 0 : cfg;
+        switch (sel / 10) {
+          case 1: fc1(C1{}, C8{}); break;
+          case 2: fc1(C2{}, C8{}); break;
+          case 3: fc1(C1{}, C4{}); break;
+          case 4: fc1(C4{}, C4{}); break;
+          default: fc1(C2{}, C4{}); break;
+        }
+        switch (sel % 10) {
+          case 2: fc2(C1{}, C8{}); break;
+          case 3: fc2(C2{}, C4{}); break;
+          case 4: fc2(C4{}, C4{}); break;
+          case 5: fc2(C1{}, C16{}); break;
+          case 6: fc2(C2{}, C16{}); break;
+          default: fc2(C2{}, C8{}); break;
         }
       };
-      if (iq2) launch(std::integral_constant<int, kFmtIq2>{});
+      if (iq2 == 2) launch(std::integral_constant<int, kFmtIq2N>{});
+      else if (iq2) launch(std::integral_constant<int, kFmtIq2>{});
       else launch(std::integral_constant<int, kFmtQ4>{});
       MoeFinalizeKernel<<<R, 256, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
       CheckLaunch();
@@ -1214,7 +1298,7 @@ void LaunchQGemv(int R, const bf16* x, const uint8_t* w, const bf16* sc, int N, 
 template <int BITS>
 struct QGemvState {
   const OrtApi& api;
-  int iq2;  // Q4Gemv only: exact IQ2_XXS LUT codes (needs 2..8 rows)
+  int iq2;  // Q4Gemv only: 1 = exact IQ2_XXS LUT codes (2..8 rows), 2 = native IQ2_XXS blocks (1..8 rows)
   QGemvState(const OrtApi& a, const OrtKernelInfo* info) : api(a), iq2(BITS == 4 ? OptAttr(info, "iq2", 0) : 0) {}
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
@@ -1225,11 +1309,18 @@ struct QGemvState {
       const int K = static_cast<int>(shape.back());
       const int R = static_cast<int>(Count(x) / K);
       const int N = static_cast<int>(Dim(w, 0));
-      if (K % 32 != 0 || Dim(w, 1) * 32 != K) throw std::invalid_argument("QGemv: K mismatch");
+      if (iq2 == 2) {  // native IQ2_XXS: B [N, K/32, 8], scale input = fp16 super-block scales [N, K/256]
+        if (K % 256 != 0 || Dim(w, 1) * 32 != K || Dim(w, 2) != 8 || R < 1 || R > 8)
+          throw std::invalid_argument("Q4Gemv iq2=2: needs B [N, K/32, 8] and 1..8 rows");
+      } else if (K % 32 != 0 || Dim(w, 1) * 32 != K) {
+        throw std::invalid_argument("QGemv: K mismatch");
+      }
       shape.back() = N;
       auto y = c.GetOutput(0, shape);
-      if (iq2 && !(R >= 2 && R <= 8 && K % 128 == 0)) throw std::invalid_argument("Q4Gemv iq2: needs 2..8 rows and K % 128 == 0");
-      if (iq2) {
+      if (iq2 == 1 && !(R >= 2 && R <= 8 && K % 128 == 0)) throw std::invalid_argument("Q4Gemv iq2: needs 2..8 rows and K % 128 == 0");
+      if (iq2 == 2) {
+        LaunchMmaGemv<kFmtIq2N>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
+      } else if (iq2) {
         LaunchMmaGemv<kFmtIq2>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K, Out<bf16>(y), Stream(api, raw));
       } else if (R >= 2 && R <= 8 && K % 64 == 0) {
         LaunchMmaGemv<BITS == 8 ? kFmtQ8 : kFmtQ4>(In<bf16>(c, 0), In<uint8_t>(c, 1), In<bf16>(c, 2), nullptr, R, N, K,

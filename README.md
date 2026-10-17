@@ -51,3 +51,15 @@ code = magnitude index (0, 1, 2 <-> 8, 25, 43) + 4 * (negative), packed low nibb
 The int4 re-quantisation used before maps {8, 25, 43} to {8.5, 25.5, 42.6} (up to 6 % error on the smallest magnitude, measurably worse NLL: +0.012 nats/token on 2k-token texts).
 The kernel decodes 4 weights per `prmt` pair (high- and low-byte LUT planes of the bf16 values), multiplies by the scale and feeds adjacent k pairs to `mma.m16n8k16`
 (the x fragments need no repacking). Same memory and bandwidth as int4. Requires 2..8 rows (the verify path); R = 1 is not implemented for `iq2=1`.
+
+## Native IQ2_XXS (`iq2=2`)
+
+`Q4Gemv` and `MoeVerify` with `iq2=2` read the IQ2_XXS data at its native 2.0625 bits per weight instead of the 4-bit LUT codes of `iq2=1`
+(2.2x smaller than int4 + bf16 scales; the Bolt-74B engine drops from 39.6 GiB to 20.3 GiB of weights). Layout (`iq2xxs_to_native` in the exporter's `bolt_weights.py`):
+`B` = `[N, K/32, 8]` uint8, the ggml 8-byte records (4 codebook-index bytes + one u32 with four 7-bit sign indices and a 4-bit scale);
+`scale` input = the fp16 super-block scales `[N, K/256]` carried as raw bits in a bf16-typed tensor. K % 256 == 0, 1..8 rows.
+Decoding: a thread owns 16 adjacent k = two codebook vectors, looked up in `kIq2xxsGridBf16` (pre-expanded bf16 magnitudes, global memory/L1), sign bits are xor-ed in
+with one IMAD + LOP per bf16 pair, then scaled by bf16(d * (0.5 + s) * 0.25): the weights are bit-identical to `iq2=1`.
+Cost: MoeVerify 111 us -> 145 us per layer (R=8, E=304, I=2304) and ~1 ms more per 8-token verify step (about 8 % lower speculative throughput) for half the weight memory.
+A shared-memory table variant was slower (per-block table fill dominates the tiny per-block work); `BOLT_MOE_CFG` selects other tilings (default is the best).
+Uniform 2-bit (ORT `QMoE` int2) cannot represent IQ2_XXS (6 magnitudes/signs from a 256-entry vector codebook): 37 % relative weight error and a destroyed model (teacher-forced NLL 12 vs 0.23).

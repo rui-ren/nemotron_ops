@@ -205,6 +205,62 @@ def test_moe_iq2(R, E, I, topk=9):
     assert rel(out, ref) < 1e-2
 
 
+def iq2_native_blocks(*lead, k):
+    """Random valid ggml IQ2_XXS blocks [*lead, k/256, 66] (any grid / sign index / scale nibble, finite fp16 d)."""
+    blk = torch.randint(0, 256, (*lead, k // 256, 66), dtype=torch.uint8)
+    d = (torch.rand(*lead, k // 256) * 0.02 + 0.001).half().view(torch.uint8).reshape(*lead, k // 256, 2)
+    blk[..., :2] = d
+    return blk
+
+
+def iq2_repack(blk):
+    """[*lead, K/256, 66] ggml blocks -> (records uint8 [*lead, K/32, 8], fp16 d bits as a bf16-typed tensor [*lead, K/256])."""
+    rec = blk[..., 2:].reshape(*blk.shape[:-2], blk.shape[-2] * 8, 8).contiguous()
+    d = blk[..., :2].contiguous().view(torch.int16).reshape(*blk.shape[:-1][:-0 or None]) if False else blk[..., :2].contiguous().view(torch.int16).squeeze(-1)
+    return rec, d.view(torch.bfloat16)
+
+
+def iq2_native_dequant(blk):
+    from gguf import GGMLQuantizationType as Q
+    from gguf import quants
+
+    flat = blk.reshape(-1, blk.shape[-2] * 66).numpy()
+    return torch.tensor(quants.dequantize(flat, Q.IQ2_XXS)).reshape(*blk.shape[:-2], blk.shape[-2] * 256)
+
+
+def test_q4_iq2_native(R, N, K):
+    torch.manual_seed(21)
+    blk = iq2_native_blocks(N, k=K)
+    x = torch.randn(R, K).bfloat16()
+    deq = iq2_native_dequant(blk).bfloat16().float()  # the kernel rounds the weight (bf16 block scale * exact magnitude) to bf16
+    ref = x.float() @ deq.T
+    wb, db = iq2_repack(blk)
+    (y,) = run("Q4Gemv", [("x", x.to(DEV)), ("w", wb.to(DEV)), ("s", db.to(DEV))], [BF], {"iq2": 2})
+    print(f"Q4Gemv iq2 native R={R} N={N} K={K}: rel err {rel(y, ref):.2e}")
+    assert rel(y, ref) < 6e-3
+
+
+def test_moe_iq2_native(R, E, I, topk=9):
+    torch.manual_seed(22)
+    z = (torch.randn(R, 1024) * 0.5).bfloat16()
+    idx = torch.stack([torch.randperm(E)[:topk] for _ in range(R)]).int()
+    w = torch.rand(R, topk)
+    b1, b2 = iq2_native_blocks(E, I, k=1024), iq2_native_blocks(E, 1024, k=I)
+    d1, d2 = iq2_native_dequant(b1).bfloat16().float(), iq2_native_dequant(b2).bfloat16().float()
+    ref = torch.zeros(R, 1024)
+    for t in range(R):
+        for j in range(topk):
+            e = idx[t, j]
+            h = (z[t].float() @ d1[e].T).bfloat16().float()
+            h = (torch.relu(h) ** 2).bfloat16().float()
+            ref[t] += w[t, j] * (h @ d2[e].T).bfloat16().float()
+    (w1, s1), (w2, s2) = iq2_repack(b1), iq2_repack(b2)
+    out = run("MoeVerify", [("z", z.to(DEV)), ("i", idx.to(DEV)), ("w", w.to(DEV)), ("w1", w1.to(DEV)), ("s1", s1.to(DEV)),
+                            ("w2", w2.to(DEV)), ("s2", s2.to(DEV))], [BF, BF, F32, I32], {"topk": topk, "iq2": 2})[0]
+    print(f"MoeVerify iq2 native R={R} E={E} I={I}: rel err {rel(out, ref):.2e}")
+    assert rel(out, ref) < 1e-2
+
+
 def test_mamba(R, heads=128, hd=64, ds=128, ng=8):
     torch.manual_seed(5)
     di = heads * hd
@@ -307,6 +363,10 @@ if __name__ == "__main__":
         test_q4_iq2(R, N, K)
     for R, E, I in ((8, 304, 2304), (3, 240, 2048), (8, 12, 2560)):
         test_moe_iq2(R, E, I, topk=9 if E > 12 else 6)
+    for R, N, K in ((8, 5376, 4096), (1, 4096, 5376), (3, 1024, 4096), (8, 4096, 5376)):
+        test_q4_iq2_native(R, N, K)
+    for R, E, I in ((8, 304, 2304), (1, 240, 1536), (5, 496, 2560), (8, 12, 2048)):
+        test_moe_iq2_native(R, E, I, topk=9 if E > 12 else 6)
     test_mamba_verify(8, 3)
     test_mamba_verify(5, 0)
     print("all passed")
