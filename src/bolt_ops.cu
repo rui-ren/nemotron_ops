@@ -64,59 +64,91 @@ int64_t Count(const Ort::ConstValue& v) {
 // MambaStep
 // ------------------------------------------------------------------------------------------------------------------
 // proj row layout: [gate (di) | xBC (conv_dim = di + 2*ng*ds) | dt (heads)]
-__global__ void MambaConvKernel(const bf16* __restrict__ proj, int R, int proj_stride, int di, int conv_dim,
+template <int R_FIXED = 0, bool ALL_ROWS = false>
+__global__ void MambaConvKernel(const bf16* __restrict__ proj, int R_rt, int proj_stride, int di, int conv_dim,
                                 const bf16* __restrict__ conv_state_in, const bf16* __restrict__ conv_w,
                                 const bf16* __restrict__ conv_b, bf16* __restrict__ conv_state_out,
-                                bf16* __restrict__ xbc_act, const int* __restrict__ sel, bool all_rows) {
+                                bf16* __restrict__ xbc_act, const int* __restrict__ sel, bool all_rows_rt) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= conv_dim) return;
+  const int R = R_FIXED > 0 ? R_FIXED : R_rt;
+  const bool all_rows = R_FIXED > 0 ? ALL_ROWS : all_rows_rt;
   // Verify mode: the input state is row `sel` of a [rows, conv_dim, 3] buffer and the state after token r goes to row r.
   if (sel) conv_state_in += static_cast<int64_t>(*sel) * conv_dim * 3;
-  float inp[3 + kMaxRows];
+  float inp[3 + (R_FIXED > 0 ? R_FIXED : kMaxRows)];
   inp[0] = B2F(conv_state_in[c * 3 + 0]);
   inp[1] = B2F(conv_state_in[c * 3 + 1]);
   inp[2] = B2F(conv_state_in[c * 3 + 2]);
-  for (int r = 0; r < R; ++r) inp[3 + r] = B2F(proj[static_cast<int64_t>(r) * proj_stride + di + c]);
-  const float w0 = B2F(conv_w[c * 4 + 0]), w1 = B2F(conv_w[c * 4 + 1]), w2 = B2F(conv_w[c * 4 + 2]),
-              w3 = B2F(conv_w[c * 4 + 3]);
+  const uint2 wv = __ldg(reinterpret_cast<const uint2*>(conv_w + c * 4));
+  const bf16* wp = reinterpret_cast<const bf16*>(&wv);
+  const float w0 = B2F(wp[0]), w1 = B2F(wp[1]), w2 = B2F(wp[2]), w3 = B2F(wp[3]);
   const float bias = B2F(conv_b[c]);
-  for (int r = 0; r < R; ++r) {
-    float acc = bias + w0 * inp[r] + w1 * inp[r + 1] + w2 * inp[r + 2] + w3 * inp[r + 3];
-    xbc_act[static_cast<int64_t>(r) * conv_dim + c] = __float2bfloat16(Silu(acc));
-  }
-  if (all_rows) {
-    for (int r = 0; r < R; ++r) {
-      bf16* o = conv_state_out + (static_cast<int64_t>(r) * conv_dim + c) * 3;
-      o[0] = __float2bfloat16(inp[r + 1]);
-      o[1] = __float2bfloat16(inp[r + 2]);
-      o[2] = __float2bfloat16(inp[r + 3]);
+  if constexpr (R_FIXED > 0) {
+#pragma unroll
+    for (int r = 0; r < R_FIXED; ++r) inp[3 + r] = B2F(proj[static_cast<int64_t>(r) * proj_stride + di + c]);
+#pragma unroll
+    for (int r = 0; r < R_FIXED; ++r) {
+      float acc = bias + w0 * inp[r] + w1 * inp[r + 1] + w2 * inp[r + 2] + w3 * inp[r + 3];
+      xbc_act[static_cast<int64_t>(r) * conv_dim + c] = __float2bfloat16(Silu(acc));
+    }
+    if constexpr (ALL_ROWS) {
+#pragma unroll
+      for (int r = 0; r < R_FIXED; ++r) {
+        bf16* o = conv_state_out + (static_cast<int64_t>(r) * conv_dim + c) * 3;
+        o[0] = __float2bfloat16(inp[r + 1]);
+        o[1] = __float2bfloat16(inp[r + 2]);
+        o[2] = __float2bfloat16(inp[r + 3]);
+      }
+    } else {
+      conv_state_out[c * 3 + 0] = __float2bfloat16(inp[R_FIXED]);
+      conv_state_out[c * 3 + 1] = __float2bfloat16(inp[R_FIXED + 1]);
+      conv_state_out[c * 3 + 2] = __float2bfloat16(inp[R_FIXED + 2]);
     }
   } else {
-    conv_state_out[c * 3 + 0] = __float2bfloat16(inp[R]);
-    conv_state_out[c * 3 + 1] = __float2bfloat16(inp[R + 1]);
-    conv_state_out[c * 3 + 2] = __float2bfloat16(inp[R + 2]);
+    for (int r = 0; r < R; ++r) inp[3 + r] = B2F(proj[static_cast<int64_t>(r) * proj_stride + di + c]);
+    for (int r = 0; r < R; ++r) {
+      float acc = bias + w0 * inp[r] + w1 * inp[r + 1] + w2 * inp[r + 2] + w3 * inp[r + 3];
+      xbc_act[static_cast<int64_t>(r) * conv_dim + c] = __float2bfloat16(Silu(acc));
+    }
+    if (all_rows) {
+      for (int r = 0; r < R; ++r) {
+        bf16* o = conv_state_out + (static_cast<int64_t>(r) * conv_dim + c) * 3;
+        o[0] = __float2bfloat16(inp[r + 1]);
+        o[1] = __float2bfloat16(inp[r + 2]);
+        o[2] = __float2bfloat16(inp[r + 3]);
+      }
+    } else {
+      conv_state_out[c * 3 + 0] = __float2bfloat16(inp[R]);
+      conv_state_out[c * 3 + 1] = __float2bfloat16(inp[R + 1]);
+      conv_state_out[c * 3 + 2] = __float2bfloat16(inp[R + 2]);
+    }
   }
 }
 
-// One block per head. State layout [heads, ds, hd] (hd contiguous), fp32. Thread (p, part) owns state[n in part][p]; the QP parts
-// split d_state (more threads per head = shorter dependent chains over the R rows).
-template <int DS, int HD, int QP>
-__global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_stride, int di, int conv_dim, int heads,
+// Block (h, pb) owns head h and p-tile pb of width PT (HD = PT * gridDim.y). State layout [heads, ds, hd] (hd contiguous), fp32.
+// Thread (p_local, part) owns state[n in part][p_base + p_local]; the QP parts split d_state.
+template <int DS, int HD, int QP, int PT = HD, int R_FIXED = 0, bool ALL_ROWS = false>
+__global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R_rt, int proj_stride, int di, int conv_dim, int heads,
                                int heads_per_group, const bf16* __restrict__ xbc_act,
                                const float* __restrict__ ssm_in, const float* __restrict__ dt_bias,
                                const float* __restrict__ a_neg, const float* __restrict__ d_skip, float tmin,
                                float* __restrict__ ssm_out, float* __restrict__ ypre, const int* __restrict__ sel,
-                               bool all_rows) {
+                               bool all_rows_rt) {
   const int h = blockIdx.x;
+  const int p_base = blockIdx.y * PT;
   const int g = h / heads_per_group;
   const int tid = threadIdx.x;
-  const int p = tid % HD;
-  const int half = tid / HD;  // 0 .. QP-1
+  const int pl = tid % PT;
+  const int p = p_base + pl;
+  const int half = tid / PT;  // 0 .. QP-1
+  const int R = R_FIXED > 0 ? R_FIXED : R_rt;
+  const bool all_rows = R_FIXED > 0 ? ALL_ROWS : all_rows_rt;
   constexpr int NH = DS / QP;
-  __shared__ float sB[kMaxRows][DS];
-  __shared__ float sC[kMaxRows][DS];
-  __shared__ float sPart[kMaxRows][QP][HD];
-  __shared__ float sDt[kMaxRows];
+  constexpr int MAX_R = R_FIXED > 0 ? R_FIXED : kMaxRows;
+  __shared__ float sB[MAX_R][DS];
+  __shared__ float sC[MAX_R][DS];
+  __shared__ float sPart[MAX_R][QP][PT];
+  __shared__ float sDt[MAX_R];
   const int b_off = di + g * DS;
   const int c_off = di + (heads / heads_per_group) * DS + g * DS;
   for (int i = tid; i < R * DS; i += blockDim.x) {
@@ -137,38 +169,66 @@ __global__ void MambaSsmKernel(const bf16* __restrict__ proj, int R, int proj_st
   for (int n = 0; n < NH; ++n) st[n] = sp[static_cast<int64_t>(n) * HD];
   const float A = a_neg[h];
   const float D = d_skip[h];
-  for (int r = 0; r < R; ++r) {
-    const float dt = sDt[r];
-    const float dA = expf(A * dt);
-    const float x = B2F(xbc_act[static_cast<int64_t>(r) * conv_dim + h * HD + p]);
-    const float dtx = dt * x;
-    float acc = 0.f;
+  if constexpr (R_FIXED > 0) {
 #pragma unroll
-    for (int n = 0; n < NH; ++n) {
-      const int nn = half * NH + n;
-      st[n] = st[n] * dA + dtx * sB[r][nn];
-      acc += sC[r][nn] * st[n];
+    for (int r = 0; r < R_FIXED; ++r) {
+      const float dt = sDt[r];
+      const float dA = expf(A * dt);
+      const float x = B2F(xbc_act[static_cast<int64_t>(r) * conv_dim + h * HD + p]);
+      const float dtx = dt * x;
+      float acc = 0.f;
+#pragma unroll
+      for (int n = 0; n < NH; ++n) {
+        const int nn = half * NH + n;
+        st[n] = st[n] * dA + dtx * sB[r][nn];
+        acc += sC[r][nn] * st[n];
+      }
+      sPart[r][half][pl] = acc;
+      if constexpr (ALL_ROWS) {
+        float* orow = ssm_out + r * row_stride + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+#pragma unroll
+        for (int n = 0; n < NH; ++n) orow[static_cast<int64_t>(n) * HD] = st[n];
+      }
     }
-    sPart[r][half][p] = acc;
-    if (all_rows) {
-      float* orow = ssm_out + r * row_stride + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+    if constexpr (!ALL_ROWS) {
+      float* op = ssm_out + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
 #pragma unroll
-      for (int n = 0; n < NH; ++n) orow[static_cast<int64_t>(n) * HD] = st[n];
+      for (int n = 0; n < NH; ++n) op[static_cast<int64_t>(n) * HD] = st[n];
     }
-  }
-  if (!all_rows) {
-    float* op = ssm_out + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+  } else {
+    for (int r = 0; r < R; ++r) {
+      const float dt = sDt[r];
+      const float dA = expf(A * dt);
+      const float x = B2F(xbc_act[static_cast<int64_t>(r) * conv_dim + h * HD + p]);
+      const float dtx = dt * x;
+      float acc = 0.f;
 #pragma unroll
-    for (int n = 0; n < NH; ++n) op[static_cast<int64_t>(n) * HD] = st[n];
+      for (int n = 0; n < NH; ++n) {
+        const int nn = half * NH + n;
+        st[n] = st[n] * dA + dtx * sB[r][nn];
+        acc += sC[r][nn] * st[n];
+      }
+      sPart[r][half][pl] = acc;
+      if (all_rows) {
+        float* orow = ssm_out + r * row_stride + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+#pragma unroll
+        for (int n = 0; n < NH; ++n) orow[static_cast<int64_t>(n) * HD] = st[n];
+      }
+    }
+    if (!all_rows) {
+      float* op = ssm_out + (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
+#pragma unroll
+      for (int n = 0; n < NH; ++n) op[static_cast<int64_t>(n) * HD] = st[n];
+    }
   }
   __syncthreads();
-  for (int i = tid; i < R * HD; i += blockDim.x) {
-    const int r = i / HD, pp = i % HD;
-    const float x = B2F(xbc_act[static_cast<int64_t>(r) * conv_dim + h * HD + pp]);
+  for (int i = tid; i < R * PT; i += blockDim.x) {
+    const int r = i / PT, pp = i % PT;
+    const float x = B2F(xbc_act[static_cast<int64_t>(r) * conv_dim + h * HD + p_base + pp]);
     float sum = D * x;
 #pragma unroll
     for (int q = 0; q < QP; ++q) sum += sPart[r][q][pp];
-    ypre[static_cast<int64_t>(r) * di + h * HD + pp] = sum;
+    ypre[static_cast<int64_t>(r) * di + h * HD + p_base + pp] = sum;
   }
 }
 
@@ -178,13 +238,41 @@ __global__ void MambaNormKernel(const bf16* __restrict__ proj, int proj_stride, 
   const int r = blockIdx.x, g = blockIdx.y;
   const int64_t base = static_cast<int64_t>(r) * di + static_cast<int64_t>(g) * group_size;
   const bf16* gate = proj + static_cast<int64_t>(r) * proj_stride + static_cast<int64_t>(g) * group_size;
+  __shared__ float red[32];
+  if (group_size == 1024 && blockDim.x == 256) {
+    const int tid = threadIdx.x;
+    float v[4];
+    float ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const int i = tid + k * 256;
+      const float gt = B2F(__ldg(gate + i));
+      v[k] = __ldg(ypre + base + i) * (gt / (1.0f + expf(-gt)));
+      ss += v[k] * v[k];
+    }
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffff, ss, o);
+    if ((tid & 31) == 0) red[tid >> 5] = ss;
+    __syncthreads();
+    if (tid < 32) {
+      float w = tid < 8 ? red[tid] : 0.f;
+      for (int o = 16; o > 0; o >>= 1) w += __shfl_down_sync(0xffffffff, w, o);
+      if (tid == 0) red[0] = w;
+    }
+    __syncthreads();
+    const float rs = rsqrtf(red[0] / group_size + eps);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const int i = tid + k * 256;
+      y[base + i] = __float2bfloat16(v[k] * rs * __ldg(norm_w + g * 1024 + i));
+    }
+    return;
+  }
   float ss = 0.f;
   for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
     const float gt = B2F(gate[i]);
     const float v = ypre[base + i] * (gt / (1.0f + expf(-gt)));
     ss += v * v;
   }
-  __shared__ float red[32];
   for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffff, ss, o);
   if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
   __syncthreads();
@@ -235,18 +323,29 @@ struct MambaStepState {
       auto xbc_act = c.GetOutput(3, std::vector<int64_t>{R, conv_dim});
       auto ypre = c.GetOutput(4, std::vector<int64_t>{R, di});
       cudaStream_t s = Stream(api, raw);
-      MambaConvKernel<<<(conv_dim + 127) / 128, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
-                                                           In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
-                                                           Out<bf16>(xbc_act), sel, verify);
-      // QP = 4 state parts (256 threads/head) for the multi-row verify path, 2 parts (128 threads) for single-token decode
-      if (R > 1) MambaSsmKernel<128, 64, 4><<<heads, 256, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
-                                                     Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
-                                                     In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
-                                                     Out<float>(ypre), sel, verify);
-      else MambaSsmKernel<128, 64, 2><<<heads, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
-                                                     Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
-                                                     In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
-                                                     Out<float>(ypre), sel, verify);
+      if (R == 8 && verify) {
+        MambaConvKernel<8, true><<<(conv_dim + 63) / 64, 64, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
+                                                                     In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
+                                                                     Out<bf16>(xbc_act), sel, verify);
+        MambaSsmKernel<128, 64, 4, 64, 8, true><<<heads, 256, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads,
+                                                                      heads / ng, Out<bf16>(xbc_act), In<float>(c, 2),
+                                                                      In<float>(c, 5), In<float>(c, 6), In<float>(c, 7),
+                                                                      tmin, Out<float>(ssm_out), Out<float>(ypre), sel,
+                                                                      verify);
+      } else {
+        MambaConvKernel<<<(conv_dim + 127) / 128, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, In<bf16>(c, 1),
+                                                               In<bf16>(c, 3), In<bf16>(c, 4), Out<bf16>(conv_out),
+                                                               Out<bf16>(xbc_act), sel, verify);
+        // QP = 4 state parts (256 threads/head) for the multi-row verify path, 2 parts (128 threads) for single-token decode
+        if (R > 1) MambaSsmKernel<128, 64, 4><<<heads, 256, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
+                                                       Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
+                                                       In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
+                                                       Out<float>(ypre), sel, verify);
+        else MambaSsmKernel<128, 64, 2><<<heads, 128, 0, s>>>(In<bf16>(c, 0), R, stride, di, conv_dim, heads, heads / ng,
+                                                       Out<bf16>(xbc_act), In<float>(c, 2), In<float>(c, 5),
+                                                       In<float>(c, 6), In<float>(c, 7), tmin, Out<float>(ssm_out),
+                                                       Out<float>(ypre), sel, verify);
+      }
       MambaNormKernel<<<dim3(R, ng), 256, 0, s>>>(In<bf16>(c, 0), stride, di, di / ng, eps, Out<float>(ypre),
                                                   In<float>(c, 8), Out<bf16>(y));
       CheckLaunch();
@@ -304,15 +403,15 @@ __global__ void RouterTopkKernel(const float* __restrict__ scores, const float* 
       val[i] = -INFINITY;
     }
   }
-  int chosen[32];
-  float cs[32];
+  int my_idx = -1;
+  float my_sc = 0.f;
   float sum = 0.f;
   for (int j = 0; j < topk; ++j) {
-    float bv = -INFINITY;
-    int bi = -1, bslot = 0;
+    float bv = -INFINITY, bsc = 0.f;
+    int bi = -1;
 #pragma unroll
     for (int i = 0; i < 16; ++i)
-      if (val[i] > bv) { bv = val[i]; bi = lane + 32 * i; bslot = i; }
+      if (val[i] > bv) { bv = val[i]; bsc = sc[i]; bi = lane + 32 * i; }
     float wv = bv;
     int wi = bi;
     for (int o = 16; o > 0; o >>= 1) {
@@ -320,25 +419,24 @@ __global__ void RouterTopkKernel(const float* __restrict__ scores, const float* 
       const int oi = __shfl_xor_sync(0xffffffff, wi, o);
       if (ov > wv || (ov == wv && oi >= 0 && (wi < 0 || oi < wi))) { wv = ov; wi = oi; }
     }
-    float s = 0.f;
-    if (wi >= 0 && (wi & 31) == lane) {
-      s = sc[wi >> 5];
+    const int win_lane = wi & 31;
+    const int win_slot = wi >> 5;
+    if (wi >= 0 && win_lane == lane) {
 #pragma unroll
       for (int i = 0; i < 16; ++i)
-        if (i == (wi >> 5)) val[i] = -INFINITY;
+        if (i == win_slot) val[i] = -INFINITY;
     }
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
-    chosen[j] = wi;
-    cs[j] = s;
+    const float s = wi >= 0 ? __shfl_sync(0xffffffff, bsc, win_lane) : 0.f;
+    if (lane == j) {
+      my_idx = wi;
+      my_sc = s;
+    }
     sum += s;
-    (void)bslot;
   }
   const float denom = sum + 1e-20f;
-  if (lane == 0) {
-    for (int j = 0; j < topk; ++j) {
-      idx_out[r * topk + j] = chosen[j];
-      w_out[r * topk + j] = cs[j] / denom * scale;
-    }
+  if (lane < topk) {
+    idx_out[r * topk + lane] = my_idx;
+    w_out[r * topk + lane] = my_sc / denom * scale;
   }
 }
 
@@ -454,11 +552,38 @@ __global__ void MoeFc2Kernel(const bf16* __restrict__ h, const int* __restrict__
 __global__ void MoeFinalizeKernel(const float* __restrict__ part, const float* __restrict__ w, int topk,
                                   bf16* __restrict__ out) {
   const int t = blockIdx.x;
-  for (int n = threadIdx.x; n < 1024; n += blockDim.x) {
-    float a = 0.f;
-    for (int k = 0; k < topk; ++k) a += w[t * topk + k] * part[(static_cast<int64_t>(t) * topk + k) * 1024 + n];
-    out[static_cast<int64_t>(t) * 1024 + n] = __float2bfloat16(a);
+  const int vec_idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (vec_idx >= 256) return;
+  const float* wt = w + t * topk;
+  const float4* pt = reinterpret_cast<const float4*>(part + static_cast<int64_t>(t) * topk * 1024) + vec_idx;
+  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  if (topk == 9) {
+#pragma unroll
+    for (int k = 0; k < 9; ++k) {
+      const float wk = wt[k];
+      const float4 pv = __ldg(pt + k * 256);
+      a0 += wk * pv.x;
+      a1 += wk * pv.y;
+      a2 += wk * pv.z;
+      a3 += wk * pv.w;
+    }
+  } else {
+    for (int k = 0; k < topk; ++k) {
+      const float wk = wt[k];
+      const float4 pv = __ldg(pt + k * 256);
+      a0 += wk * pv.x;
+      a1 += wk * pv.y;
+      a2 += wk * pv.z;
+      a3 += wk * pv.w;
+    }
   }
+  uint2 out2;
+  bf16* op = reinterpret_cast<bf16*>(&out2);
+  op[0] = __float2bfloat16(a0);
+  op[1] = __float2bfloat16(a1);
+  op[2] = __float2bfloat16(a2);
+  op[3] = __float2bfloat16(a3);
+  reinterpret_cast<uint2*>(out + static_cast<int64_t>(t) * 1024)[vec_idx] = out2;
 }
 
 struct MoeDecodeState {
@@ -484,7 +609,7 @@ struct MoeDecodeState {
                                                          In<bf16>(c, 4), Out<bf16>(h));
       MoeFc2Kernel<<<dim3(R * topk, 1024 / 8), 256, 0, s>>>(Out<bf16>(h), In<int>(c, 1), I, In<uint8_t>(c, 5),
                                                            In<bf16>(c, 6), Out<float>(part));
-      MoeFinalizeKernel<<<R, 256, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
+      MoeFinalizeKernel<<<dim3(R, 4), 64, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -709,15 +834,15 @@ __device__ __forceinline__ void LoadWeightRow(const uint8_t* w, const void* sc, 
     const uint2 v = __ldg(reinterpret_cast<const uint2*>(w + row * (K / 2) + 32 * c + 8 * t));
     raw = make_uint4(v.x, v.y, 0u, 0u);
     if constexpr (FMT == kFmtQ4 || FMT == kFmtIq2) scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 2 * c + (t >> 1)]);
-    else scale[0] = Fp8E4M3ToFloat(reinterpret_cast<const uint8_t*>(sc)[row * (K / 16) + 4 * c + t]);
+    else scale[0] = Fp8E4M3ToFloat(reinterpret_cast<const uint8_t*>(sc)[row * (K / 16) + 4 * c + t]) * 0x1p110f;
   } else {
     raw = __ldg(reinterpret_cast<const uint4*>(w + row * (K / 2) + 64 * c + 16 * t));
     if constexpr (FMT == kFmtQ4 || FMT == kFmtIq2) {
-      scale[0] = scale[1] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 4 * c + t]);
+      scale[0] = B2F(reinterpret_cast<const bf16*>(sc)[row * (K / 32) + 4 * c + t]);
     } else {
       const uint16_t two = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(sc) + row * (K / 16) + 8 * c + 2 * t);
-      scale[0] = Fp8E4M3ToFloat(two & 0xFFu);
-      scale[1] = Fp8E4M3ToFloat(two >> 8);
+      scale[0] = Fp8E4M3ToFloat(two & 0xFFu) * 0x1p110f;
+      scale[1] = Fp8E4M3ToFloat(two >> 8) * 0x1p110f;
     }
   }
 }
@@ -725,8 +850,9 @@ __device__ __forceinline__ void LoadWeightRow(const uint8_t* w, const void* sc, 
 template <int FMT, bool WIDE, int MT>
 struct StageT {
   static constexpr int NH = WIDE ? 2 : 1;  // 16-k halves per thread and chunk
+  static constexpr int NSC = (FMT == kFmtFp4 && WIDE) ? 2 : 1;
   uint4 raw[MT][2];
-  float sc[MT][2][NH];
+  float sc[MT][2][NSC];
   uint4 x[2 * NH];
 };
 
@@ -779,16 +905,15 @@ __device__ __forceinline__ void DequantRow(const uint4& raw, float scale, uint32
       hi[s] = AsU32(__hmul2(__hsub2(AsBf162(b), zp), sc2));
     }
   } else {
-    // e2m1 -> bf16 pattern worth value * 2^-126 (subnormal for |v| = 0.5), renormalised by 2^126, then the block scale
+    // e2m1 -> bf16 pattern worth value * 2^-126 (subnormal for |v| = 0.5); scale is pre-multiplied by 2^110 and epilogue by 2^16.
     const __nv_bfloat162 sc2 = __bfloat162bfloat162(__float2bfloat16(scale));
-    const __nv_bfloat162 renorm = AsBf162(0x7E807E80u);
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       const uint32_t pa = raw.x >> (4 * s), pb = raw.y >> (4 * s);
       const uint32_t a = ((pa << 6) & 0x01C001C0u) | ((pa << 12) & 0x80008000u);
       const uint32_t b = ((pb << 6) & 0x01C001C0u) | ((pb << 12) & 0x80008000u);
-      lo[s] = AsU32(__hmul2(__hmul2(AsBf162(a), renorm), sc2));
-      hi[s] = AsU32(__hmul2(__hmul2(AsBf162(b), renorm), sc2));
+      lo[s] = AsU32(__hmul2(AsBf162(a), sc2));
+      hi[s] = AsU32(__hmul2(AsBf162(b), sc2));
     }
   }
 }
@@ -830,8 +955,9 @@ __device__ __forceinline__ void ComputeStage(const StageT<FMT, WIDE, MT>& st, fl
           r1 = make_uint4(r1.z, r1.w, 0u, 0u);
         }
       }
-      DequantRow<FMT>(r0, st.sc[m][0][h], lo0, hi0);
-      DequantRow<FMT>(r1, st.sc[m][1][h], lo1, hi1);
+      constexpr int sh = (FMT == kFmtFp4 && WIDE) ? 1 : 0;
+      DequantRow<FMT>(r0, st.sc[m][0][h * sh], lo0, hi0);
+      DequantRow<FMT>(r1, st.sc[m][1][h * sh], lo1, hi1);
 #pragma unroll
       for (int s = 0; s < 4; ++s) Mma16816(acc[m], lo0[s], lo1[s], hi0[s], hi1[s], bl[s], bh[s]);
     }
@@ -908,7 +1034,7 @@ __global__ void __launch_bounds__(KW * 32)
       }
     LoadX<NH>(xr, xvalid, c, t, st.x);
   });
-  const float gs = gscale ? gscale[0] : 1.0f;
+  const float gs = (gscale ? gscale[0] : 1.0f) * (FMT == kFmtFp4 ? 0x1p16f : 1.0f);
   ReduceEpilogue<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
     if (col < R && n_base + rl < N) y[static_cast<int64_t>(col) * N + n_base + rl] = __float2bfloat16(v * gs);
   });
@@ -958,20 +1084,24 @@ void LaunchMmaGemv(const bf16* x, const uint8_t* w, const void* sc, const float*
 __global__ void MoeGroupKernel(const int* __restrict__ idx, int P, int topk, int* __restrict__ meta) {
   __shared__ int sidx[128], srank[128], warp_tot[4];
   const int p = threadIdx.x, lane = p & 31, warp = p >> 5;
+#pragma unroll 5
   for (int i = p; i < P * 8; i += blockDim.x) meta[1 + P + i] = -1;
   if (p < P) sidx[p] = idx[p];
   __syncthreads();
   int q = -1;
   if (p < P) {
+    const int my = sidx[p];
     for (int j = 0; j <= p; ++j)
-      if (sidx[j] == sidx[p]) { q = j; break; }
+      if (sidx[j] == my) { q = j; break; }
   }
   const bool first = p < P && q == p;
   const unsigned b = __ballot_sync(0xffffffffu, first);
   if (lane == 0) warp_tot[warp] = __popc(b);
   __syncthreads();
   int off = 0;
-  for (int w = 0; w < warp; ++w) off += warp_tot[w];
+#pragma unroll
+  for (int w = 0; w < 4; ++w)
+    if (w < warp) off += warp_tot[w];
   if (first) {
     srank[p] = off + __popc(b & ((1u << lane) - 1u));
     meta[1 + srank[p]] = sidx[p];
@@ -1020,12 +1150,13 @@ __global__ void __launch_bounds__(KW * 32)
       }
     LoadX<NH>(xr, xvalid, c, t, st.x);
   });
+  constexpr float gs = FMT == kFmtFp4 ? 0x1p16f : 1.0f;
   ReduceEpilogue<MT, KW>(acc, warp, g, t, [&](int rl, int col, float v) {
     const int j = n_base + rl;
     if (j >= Nrows) return;
     const int pair = pair_of[col];
     if (pair < 0) return;
-    v = B2F(__float2bfloat16(v));
+    v = B2F(__float2bfloat16(v * gs));
     if constexpr (PH == 1) {
       const float r = fmaxf(v, 0.f);
       reinterpret_cast<bf16*>(out)[static_cast<int64_t>(pair) * Nrows + j] = __float2bfloat16(r * r);
@@ -1116,7 +1247,7 @@ struct MoeVerifyState {
       if (iq2 == 2) launch(std::integral_constant<int, kFmtIq2N>{});
       else if (iq2) launch(std::integral_constant<int, kFmtIq2>{});
       else launch(std::integral_constant<int, kFmtQ4>{});
-      MoeFinalizeKernel<<<R, 256, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
+      MoeFinalizeKernel<<<dim3(R, 4), 64, 0, s>>>(Out<float>(part), In<float>(c, 2), topk, Out<bf16>(out));
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
